@@ -216,6 +216,10 @@ async fn main() {
         }
     }
 
+    if let Some(worker_domain) = config.cf_worker_domain() {
+        info!("  Cloudflare Worker: {}", worker_domain);
+    }
+
     if !config.mtproto_proxies.is_empty() {
         info!("  Upstream MTProto proxies (WS fallback):");
         for p in &config.mtproto_proxies {

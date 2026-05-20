@@ -40,3 +40,20 @@ fn plain_secret_still_generates_dd_link() {
     assert_eq!(cfg.listen_faketls_domain(), None);
     assert_eq!(cfg.link_secret(), format!("dd{}", key));
 }
+
+#[test]
+fn cf_worker_domain_accepts_python_alias_and_normalizes_url() {
+    // The Python reference uses --cfproxy-worker-domain; keep that spelling
+    // working while advertising the shorter Rust-style --cf-worker-domain.
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--cfproxy-worker-domain",
+        "https://example.user.workers.dev/apiws",
+    ])
+    .unwrap();
+
+    assert_eq!(
+        cfg.cf_worker_domain().as_deref(),
+        Some("example.user.workers.dev")
+    );
+}

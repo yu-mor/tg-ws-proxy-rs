@@ -90,7 +90,7 @@ When `--cf-domain` is configured the proxy:
    configured) and finally direct TCP.
 
 When no `--dc-ip` is configured for a DC, the CF proxy is tried as the
-**primary** path (before upstreams / TCP fallback).  If `--dc-ip` is omitted
+**primary** path (before upstreams / TCP fallback). If `--dc-ip` is omitted
 entirely and `--cf-domain` is set, CF proxy becomes the primary path for
 **all** DCs.
 

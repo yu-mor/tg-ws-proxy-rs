@@ -9,6 +9,7 @@ tunnels them through WebSocket (TLS) connections to Telegram's DC servers.
 ```
 Telegram Desktop → MTProto (TCP 1443) → tg-ws-proxy-rs → WS (TLS 443) → Telegram DC
                                                          ↘ CF proxy (kws{N}.{cf-domain}) → Telegram DC  (WS via Cloudflare)
+                                                         ↘ CF Worker (*.workers.dev) → Telegram DC  (TCP tunnel via Cloudflare)
                                                          ↘ upstream MTProto proxy → Telegram DC  (WS fallback)
                                                          ↘ direct TCP :443 → Telegram DC          (last resort)
 ```
@@ -100,6 +101,7 @@ tg-ws-proxy [OPTIONS]
 | `--buf-kb <KB>` | `256` | Socket buffer size |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
 | `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated (see [CF Proxy](#cloudflare-proxy)) |
+| `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain for TCP-tunnel fallback, no owned domain required (see [Cloudflare Worker](#cloudflare-worker)) |
 | `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed, see [Default domains](#default-domains)) |
 | `--cf-priority` | off | Try CF proxy **before** direct WS for all DCs (see [CF Proxy](#cloudflare-proxy)) |
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` values (see [CF Proxy](#cloudflare-proxy)) |
@@ -113,7 +115,8 @@ tg-ws-proxy [OPTIONS]
 Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
-`TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_PRIORITY`, `TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`).
+`TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_WORKER_DOMAIN`, `TG_CF_PRIORITY`,
+`TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`).
 
 ### Examples
 
@@ -129,6 +132,9 @@ tg-ws-proxy --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef123456
 
 # With Cloudflare proxy domain (WS fallback via Cloudflare CDN)
 tg-ws-proxy --cf-domain yourdomain.com
+
+# With Cloudflare Worker (free workers.dev TCP tunnel fallback)
+tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev
 
 # CF proxy only: omit --dc-ip so CF proxy handles all DCs
 tg-ws-proxy --cf-domain yourdomain.com --cf-priority
@@ -273,9 +279,9 @@ tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
 TG_CF_DOMAIN=yourdomain.com tg-ws-proxy
 ```
 
-The proxy will try the CF path as a fallback after direct WebSocket fails, and
-as the primary path for DCs that have no `--dc-ip` configured.  With
-`--cf-priority`, the CF proxy is tried **before** direct WebSocket for all DCs.
+The proxy will try the CF path as a fallback after direct WebSocket fails.
+With `--cf-priority`, the CF proxy is tried **before** direct WebSocket for all
+DCs.
 
 #### `--cf-balance` — round-robin load balancing
 
@@ -320,6 +326,36 @@ tg-ws-proxy --cf-domain d1.example.com,d2.example.com --cf-balance --cf-priority
    | `kws203-1`| `91.105.192.100`  |
 
 See [docs/CfProxy.md](docs/CfProxy.md) for full instructions.
+
+### Cloudflare Worker
+
+Cloudflare Worker mode is an alternative to `--cf-domain` when you do not own
+a domain. Deploy the Worker script from [docs/CfWorker.md](docs/CfWorker.md),
+copy its `*.workers.dev` domain, and pass it to the proxy:
+
+```bash
+tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev
+```
+
+Or via environment variable:
+
+```bash
+TG_CF_WORKER_DOMAIN=random-symbols-1234.username.workers.dev tg-ws-proxy
+```
+
+The Worker accepts an outer WebSocket connection from `tg-ws-proxy-rs`, opens a
+raw TCP connection to the selected Telegram DC IP, and forwards WebSocket
+message payloads as TCP bytes:
+
+```
+tg-ws-proxy-rs → wss://<worker>/apiws?dst=<dc-ip>&dc=<dc>&media=<0|1>
+Cloudflare Worker → TCP <dc-ip>:443
+```
+
+For DCs with a configured direct WebSocket target, direct WS is tried first and
+the Worker is used only after that path fails. For DCs without a direct WS
+target, the Worker is tried before the regular Cloudflare proxy/default
+domains and the remaining fallbacks.
 
 ### Default domains
 
@@ -478,15 +514,17 @@ chmod +x /etc/init.d/tg-ws-proxy
    IP).
 4. The relay init packet is sent to Telegram, and bidirectional bridging
    begins with AES-256-CTR re-encryption (client keys ↔ relay keys).
-5. If WebSocket is unavailable, the proxy tries the Cloudflare proxy path
-   (`wss://kwsN.{cf-domain}/apiws`) if `--cf-domain` is configured —
-   Cloudflare terminates TLS and forwards plain WebSocket traffic to Telegram.
-6. If CF proxy is unavailable or not configured, each upstream MTProto proxy
+5. If WebSocket is unavailable and Cloudflare Worker is configured, the proxy can open
+   `wss://<worker>/apiws?dst=<dc-ip>` and tunnel raw TCP traffic to the DC via
+   the Worker.
+6. If Worker is unavailable or not configured, the proxy tries the Cloudflare
+   proxy path (`wss://kwsN.{cf-domain}/apiws`) if `--cf-domain` is configured.
+7. If CF paths are unavailable or not configured, each upstream MTProto proxy
    is tried in order (generating a fresh client handshake with the upstream's
    secret so it can route to the correct DC).
-7. If no upstream proxy is configured or all fail, the proxy falls back to
+8. If no upstream proxy is configured or all fail, the proxy falls back to
    direct TCP on port 443.
-8. A small pool of pre-connected WebSocket connections is maintained per DC to
+9. A small pool of pre-connected WebSocket connections is maintained per DC to
    reduce connection latency for subsequent clients.
 
 ## Project structure
@@ -502,6 +540,9 @@ src/
   pool.rs              — Pre-warmed WebSocket connection pool per DC
   proxy.rs             — Client handler, re-encryption bridge, TCP fallback logic
   default_domains.rs   — Fetches and deobfuscates the default CF proxy domain list
+docs/
+  CfProxy.md           — Cloudflare DNS proxy setup
+  CfWorker.md          — Cloudflare Worker TCP tunnel setup
 .cargo/
   config.toml          — Cross-compilation target presets (commented out)
 ```
@@ -518,6 +559,7 @@ TG_MAX_CONNECTIONS=64
 TG_QUIET=true
 TG_VERBOSE=false
 TG_CF_DOMAIN=yourdomain.com
+TG_CF_WORKER_DOMAIN=random-symbols-1234.username.workers.dev
 TG_CF_PRIORITY=false
 TG_CF_BALANCE=false
 TG_DEFAULT_DOMAINS=false

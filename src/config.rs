@@ -195,7 +195,8 @@ pub struct Config {
     /// tried in the order given (first domain has highest priority).
     ///
     /// The CF proxy is tried as a fallback after direct WebSocket connections
-    /// fail, and as the primary path when no `--dc-ip` is configured for a DC.
+    /// fail. For DCs without `--dc-ip`, the Python fallback order is used:
+    /// Worker, regular CF proxy, upstream proxies, then direct TCP.
     #[arg(
         long = "cf-domain",
         value_name = "DOMAIN",
@@ -203,6 +204,19 @@ pub struct Config {
         env = "TG_CF_DOMAIN"
     )]
     pub cf_domains: Vec<String>,
+
+    /// Cloudflare Worker domain for the TCP-tunnel fallback.
+    ///
+    /// The Worker accepts WebSocket connections at `/apiws` and opens a raw
+    /// TCP connection to the Telegram DC IP passed in the query string. Unlike
+    /// `--cf-domain`, this does not require owning a Cloudflare DNS zone.
+    #[arg(
+        long = "cf-worker-domain",
+        alias = "cfproxy-worker-domain",
+        value_name = "DOMAIN",
+        env = "TG_CF_WORKER_DOMAIN"
+    )]
+    pub cf_worker_domain: Option<String>,
 
     /// Prioritise Cloudflare proxy over direct WebSocket connections for all
     /// DCs (even those with `--dc-ip` configured).
@@ -418,6 +432,30 @@ impl Config {
     /// Map of DC ID → target IP from `--dc-ip` flags.
     pub fn dc_redirects(&self) -> HashMap<u32, String> {
         self.dc_ip.iter().cloned().collect()
+    }
+
+    /// Cloudflare Worker domain normalized for `Host` and TLS SNI use.
+    pub fn cf_worker_domain(&self) -> Option<String> {
+        let domain = self.cf_worker_domain.as_deref()?.trim();
+        if domain.is_empty() {
+            return None;
+        }
+
+        let domain = domain
+            .strip_prefix("https://")
+            .or_else(|| domain.strip_prefix("http://"))
+            .unwrap_or(domain);
+        let domain = domain
+            .split_once('/')
+            .map(|(host, _)| host)
+            .unwrap_or(domain)
+            .trim_end_matches('/');
+
+        if domain.is_empty() {
+            None
+        } else {
+            Some(domain.to_string())
+        }
     }
 
     /// The hostname/IP to advertise in the generated `tg://proxy` link.

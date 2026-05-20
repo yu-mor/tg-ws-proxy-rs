@@ -87,6 +87,17 @@ pub async fn connect_ws(
     skip_tls_verify: bool,
     timeout: Duration,
 ) -> WsConnectResult {
+    connect_ws_with_path(ip, domain, "/apiws", true, skip_tls_verify, timeout).await
+}
+
+async fn connect_ws_with_path(
+    ip: &str,
+    domain: &str,
+    path: &str,
+    request_binary_subprotocol: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+) -> WsConnectResult {
     // ── TCP connection to the configured IP ──────────────────────────────
     let tcp = match tokio::time::timeout(timeout, TcpStream::connect(format!("{}:443", ip))).await {
         Ok(Ok(s)) => s,
@@ -98,7 +109,7 @@ pub async fn connect_ws(
     let _ = tcp.set_nodelay(true);
 
     // ── Build WebSocket request with Telegram-required headers ───────────
-    let url = format!("wss://{}/apiws", domain);
+    let url = format!("wss://{}{}", domain, path);
     let mut request = match url.into_client_request() {
         Ok(r) => r,
         Err(e) => return WsConnectResult::Failed(format!("bad URL: {}", e)),
@@ -106,7 +117,9 @@ pub async fn connect_ws(
     {
         let h = request.headers_mut();
 
-        h.insert("Sec-WebSocket-Protocol", HeaderValue::from_static("binary"));
+        if request_binary_subprotocol {
+            h.insert("Sec-WebSocket-Protocol", HeaderValue::from_static("binary"));
+        }
         h.insert(
             "Origin",
             HeaderValue::from_static("https://web.telegram.org"),
@@ -160,6 +173,19 @@ pub async fn connect_ws(
         }
         Err(_) => WsConnectResult::Failed("WebSocket handshake timed out".into()),
     }
+}
+
+/// Path used by the Cloudflare Worker TCP-tunnel mode.
+///
+/// The Worker accepts a WebSocket at `/apiws`, opens a raw TCP connection to
+/// `dst:443`, and forwards every WebSocket message payload as TCP bytes.
+pub fn cf_worker_path(dst: &str, dc: u32, is_media: bool) -> String {
+    format!(
+        "/apiws?dst={}&dc={}&media={}",
+        dst,
+        dc,
+        if is_media { 1 } else { 0 }
+    )
 }
 
 /// Return `true` when `reason` describes a DNS lookup failure.
@@ -372,6 +398,63 @@ pub async fn connect_cf_ws_for_dc(
     }
 
     (None, all_redirects)
+}
+
+/// Connect through a Cloudflare Worker TCP tunnel.
+///
+/// Unlike `--cf-domain`, the Worker does not expose `kws{N}` subdomains.  We
+/// connect to the Worker domain and pass the real Telegram DC destination in
+/// the query string. The returned stream is the outer WebSocket to the Worker;
+/// the Worker forwards its binary frames to Telegram as raw TCP bytes.
+pub async fn connect_cf_worker_ws_for_dc(
+    worker_domain: &str,
+    dst: &str,
+    dc: u32,
+    is_media: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+) -> Option<TgWsStream> {
+    let path = cf_worker_path(dst, dc, is_media);
+    debug!(
+        "CF Worker trying DC{}{} → {} via {}",
+        dc,
+        if is_media { "m" } else { "" },
+        dst,
+        worker_domain
+    );
+
+    match connect_ws_with_path(
+        worker_domain,
+        worker_domain,
+        &path,
+        false,
+        skip_tls_verify,
+        timeout,
+    )
+    .await
+    {
+        WsConnectResult::Connected(ws) => Some(ws),
+        WsConnectResult::Redirect(code) => {
+            warn!(
+                "CF Worker DC{}{} got {} from {} (redirect)",
+                dc,
+                if is_media { "m" } else { "" },
+                code,
+                worker_domain
+            );
+            None
+        }
+        WsConnectResult::Failed(reason) => {
+            warn!(
+                "CF Worker DC{}{} failed on {}: {}",
+                dc,
+                if is_media { "m" } else { "" },
+                worker_domain,
+                reason
+            );
+            None
+        }
+    }
 }
 
 /// Send a binary WebSocket message and flush.
