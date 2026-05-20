@@ -27,10 +27,10 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use crate::config::{Config, MtProtoProxy};
+use crate::config::{Config, MtProtoProxy, default_dc_ips};
 use crate::crypto::{ProtoTag, generate_client_handshake};
 use crate::faketls;
-use crate::ws_client::connect_cf_ws_for_dc;
+use crate::ws_client::{connect_cf_worker_ws_for_dc, connect_cf_ws_for_dc};
 
 // ─── Probe result ─────────────────────────────────────────────────────────────
 
@@ -74,6 +74,23 @@ async fn probe_cf_domain(domain: &str, skip_tls: bool, timeout: Duration) -> Pro
     } else {
         ProbeStatus::Fail(
             "WebSocket connection failed — check DNS records and Cloudflare settings".to_string(),
+        )
+    }
+}
+
+/// Probe a Cloudflare Worker by opening its WebSocket tunnel to DC 2.
+async fn probe_cf_worker(domain: &str, skip_tls: bool, timeout: Duration) -> ProbeStatus {
+    let Some(dst) = default_dc_ips().get(&2).cloned() else {
+        return ProbeStatus::Fail("DC 2 default IP is missing".to_string());
+    };
+
+    let start = Instant::now();
+    let ws = connect_cf_worker_ws_for_dc(domain, &dst, 2, false, skip_tls, timeout).await;
+    if ws.is_some() {
+        ProbeStatus::Ok(start.elapsed())
+    } else {
+        ProbeStatus::Fail(
+            "Worker WebSocket tunnel failed — check Worker code and domain".to_string(),
         )
     }
 }
@@ -187,10 +204,15 @@ pub async fn run_check(config: &Config) -> bool {
     println!("  tg-ws-proxy connectivity check");
     println!("{}", sep);
 
-    if config.cf_domains.is_empty() && config.mtproto_proxies.is_empty() {
+    let cf_worker_domain = config.cf_worker_domain();
+
+    if config.cf_domains.is_empty()
+        && cf_worker_domain.is_none()
+        && config.mtproto_proxies.is_empty()
+    {
         println!();
         println!("  Nothing to check.");
-        println!("  Configure --cf-domain and/or --mtproto-proxy and re-run.");
+        println!("  Configure --cf-domain, --cf-worker-domain and/or --mtproto-proxy and re-run.");
         println!("{}", sep);
         return true;
     }
@@ -213,6 +235,21 @@ pub async fn run_check(config: &Config) -> bool {
             if !status.is_ok() {
                 all_ok = false;
             }
+        }
+    }
+
+    // ── Cloudflare Worker probe ──────────────────────────────────────────
+    if let Some(domain) = cf_worker_domain {
+        println!();
+        println!("Cloudflare Worker (DC2 TCP tunnel probe):");
+        print!("  {:40}  ... ", domain);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        let status = probe_cf_worker(&domain, skip_tls, cf_timeout).await;
+        println!("[{}]  {}", status.marker(), status.detail());
+
+        if !status.is_ok() {
+            all_ok = false;
         }
     }
 

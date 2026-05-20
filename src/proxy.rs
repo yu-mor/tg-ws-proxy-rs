@@ -43,7 +43,9 @@ use crate::faketls::{
 };
 use crate::pool::WsPool;
 use crate::splitter::MsgSplitter;
-use crate::ws_client::{TgWsStream, connect_cf_ws_for_dc, connect_ws_for_dc, ws_send};
+use crate::ws_client::{
+    TgWsStream, connect_cf_worker_ws_for_dc, connect_cf_ws_for_dc, connect_ws_for_dc, ws_send,
+};
 
 // WS failure cooldown is global for the process lifetime.
 use std::collections::HashMap;
@@ -124,6 +126,8 @@ fn balanced_cf_domains(cf_domains: &[String]) -> Vec<String> {
 
 /// Per-DC cooldown for the CF proxy path.
 static CF_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
+/// Per-DC cooldown for the Cloudflare Worker path.
+static CF_WORKER_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
 type TcpReader = ReadHalf<TcpStream>;
 type TcpWriter = WriteHalf<TcpStream>;
 
@@ -146,6 +150,29 @@ fn cf_in_cooldown(dc: u32, is_media: bool) -> bool {
         if let Some(&until) = map.get(&(dc, is_media)) {
             return Instant::now() < until;
         }
+    }
+    false
+}
+
+fn set_cf_worker_cooldown(dc: u32, is_media: bool, cooldown: Duration) {
+    let mut lock = CF_WORKER_FAIL_UNTIL.lock().unwrap();
+    lock.get_or_insert_with(HashMap::new)
+        .insert((dc, is_media), Instant::now() + cooldown);
+}
+
+fn clear_cf_worker_cooldown(dc: u32, is_media: bool) {
+    let mut lock = CF_WORKER_FAIL_UNTIL.lock().unwrap();
+    if let Some(map) = lock.as_mut() {
+        map.remove(&(dc, is_media));
+    }
+}
+
+fn cf_worker_in_cooldown(dc: u32, is_media: bool) -> bool {
+    let lock = CF_WORKER_FAIL_UNTIL.lock().unwrap();
+    if let Some(map) = lock.as_ref()
+        && let Some(&until) = map.get(&(dc, is_media))
+    {
+        return Instant::now() < until;
     }
     false
 }
@@ -414,10 +441,13 @@ pub async fn handle_client(
 
     // ── Step 5: route the connection ──────────────────────────────────────
     let target_ip = dc_redirects.get(&dc_id).cloned();
+    let cf_worker_domain = config.cf_worker_domain();
     let media_tag = if is_media { "m" } else { "" };
 
     if target_ip.is_none() {
-        // DC not in config — try CF proxy, then upstream proxies, then TCP fallback.
+        // DC not in config — match the Python fallback order:
+        // CF Worker, CF proxy/default domains, then TCP fallback.  Rust keeps
+        // upstream MTProto proxies before TCP as an extra fallback tier.
         let reason = format!("DC{} not in --dc-ip config", dc_id);
         let fallback = match dc_fallback_ips.get(&dc_id) {
             Some(ip) => ip.clone(),
@@ -426,6 +456,52 @@ pub async fn handle_client(
                 return;
             }
         };
+
+        // ── Try Cloudflare Worker if configured ──────────────────────────
+        if let Some(worker_domain) = cf_worker_domain.as_deref() {
+            if !cf_worker_in_cooldown(dc_id, is_media) {
+                debug!(
+                    "[{}] DC{}{} {} → trying CF Worker {} for {}",
+                    label, dc_id, media_tag, reason, worker_domain, fallback
+                );
+
+                if let Some(ws) = connect_cf_worker_ws_for_dc(
+                    worker_domain,
+                    &fallback,
+                    dc_id,
+                    is_media,
+                    skip_tls,
+                    cf_connect_timeout,
+                )
+                .await
+                {
+                    clear_cf_worker_cooldown(dc_id, is_media);
+                    info!(
+                        "[{}] DC{}{} {} → CF Worker connected",
+                        label, dc_id, media_tag, reason
+                    );
+                    bridge_ws(
+                        &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
+                    )
+                    .await;
+                    return;
+                } else {
+                    set_cf_worker_cooldown(dc_id, is_media, cf_fail_cooldown);
+                    warn!(
+                        "[{}] DC{}{} CF Worker failed, cooldown {}s",
+                        label,
+                        dc_id,
+                        media_tag,
+                        cf_fail_cooldown.as_secs()
+                    );
+                }
+            } else {
+                debug!(
+                    "[{}] DC{}{} CF Worker in cooldown, skipping",
+                    label, dc_id, media_tag
+                );
+            }
+        }
 
         // ── Try Cloudflare proxy if configured ────────────────────────────
         if !config.cf_domains.is_empty() {
@@ -679,6 +755,50 @@ pub async fn handle_client(
                     );
                 }
 
+                // ── Try Cloudflare Worker if configured ──────────────────
+                if let Some(worker_domain) = cf_worker_domain.as_deref() {
+                    if !cf_worker_in_cooldown(dc_id, is_media) {
+                        debug!(
+                            "[{}] DC{}{} WS failed → trying CF Worker {} for {}",
+                            label, dc_id, media_tag, worker_domain, target_ip
+                        );
+
+                        if let Some(ws) = connect_cf_worker_ws_for_dc(
+                            worker_domain,
+                            &target_ip,
+                            dc_id,
+                            is_media,
+                            skip_tls,
+                            cf_connect_timeout,
+                        )
+                        .await
+                        {
+                            clear_cf_worker_cooldown(dc_id, is_media);
+                            info!("[{}] DC{}{} → CF Worker connected", label, dc_id, media_tag);
+                            bridge_ws(
+                                &label, reader, writer, ws, relay_init, ciphers, proto, dc_id,
+                                is_media,
+                            )
+                            .await;
+                            return;
+                        } else {
+                            set_cf_worker_cooldown(dc_id, is_media, cf_fail_cooldown);
+                            warn!(
+                                "[{}] DC{}{} CF Worker failed, cooldown {}s",
+                                label,
+                                dc_id,
+                                media_tag,
+                                cf_fail_cooldown.as_secs()
+                            );
+                        }
+                    } else {
+                        debug!(
+                            "[{}] DC{}{} CF Worker in cooldown, skipping",
+                            label, dc_id, media_tag
+                        );
+                    }
+                }
+
                 // ── Try Cloudflare proxy if configured ────────────────────
                 // (Skip if --cf-priority already tried the CF path above.)
                 if !config.cf_priority && !config.cf_domains.is_empty() {
@@ -689,7 +809,7 @@ pub async fn handle_client(
                             config.cf_domains.clone()
                         };
                         debug!(
-                            "[{}] DC{}{} WS failed → trying CF proxy",
+                            "[{}] DC{}{} WS/Worker failed → trying CF proxy",
                             label, dc_id, media_tag
                         );
 
