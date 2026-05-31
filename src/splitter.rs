@@ -78,27 +78,32 @@ impl MsgSplitter {
         self.plain_buf.extend_from_slice(&plain);
 
         let mut parts = Vec::new();
+        let mut consumed = 0usize;
         loop {
-            match self.next_packet_len() {
+            match self.next_packet_len(consumed) {
                 None => break, // need more bytes
                 Some(0) => {
                     // Unsupported / unknown protocol variant — disable parsing
                     // and flush everything buffered so far.
-                    parts.push(self.cipher_buf.clone());
+                    parts.push(self.cipher_buf[consumed..].to_vec());
 
                     self.cipher_buf.clear();
                     self.plain_buf.clear();
                     self.disabled = true;
 
-                    break;
+                    return parts;
                 }
                 Some(len) => {
-                    parts.push(self.cipher_buf[..len].to_vec());
-
-                    self.cipher_buf.drain(..len);
-                    self.plain_buf.drain(..len);
+                    let end = consumed + len;
+                    parts.push(self.cipher_buf[consumed..end].to_vec());
+                    consumed = end;
                 }
             }
+        }
+
+        if consumed != 0 {
+            self.cipher_buf.drain(..consumed);
+            self.plain_buf.drain(..consumed);
         }
 
         parts
@@ -122,14 +127,15 @@ impl MsgSplitter {
 
     /// Returns the byte length of the next complete packet (header + payload),
     /// `None` if there isn't enough data yet, or `Some(0)` for unknown proto.
-    fn next_packet_len(&self) -> Option<usize> {
-        if self.plain_buf.is_empty() {
+    fn next_packet_len(&self, offset: usize) -> Option<usize> {
+        let plain = self.plain_buf.get(offset..)?;
+        if plain.is_empty() {
             return None;
         }
 
         match self.proto {
-            ProtoTag::Abridged => self.abridged_len(),
-            ProtoTag::Intermediate | ProtoTag::PaddedIntermediate => self.intermediate_len(),
+            ProtoTag::Abridged => Self::abridged_len(plain),
+            ProtoTag::Intermediate | ProtoTag::PaddedIntermediate => Self::intermediate_len(plain),
         }
     }
 
@@ -137,16 +143,14 @@ impl MsgSplitter {
     ///
     /// - 1-byte header: payload_len = (byte & 0x7F) * 4
     /// - 4-byte header (first byte is 0x7F or 0xFF): payload_len = next_3_bytes_le * 4
-    fn abridged_len(&self) -> Option<usize> {
-        let first = self.plain_buf[0];
+    fn abridged_len(plain: &[u8]) -> Option<usize> {
+        let first = plain[0];
         let (payload_len, header_len) = if first == 0x7F || first == 0xFF {
-            if self.plain_buf.len() < 4 {
+            if plain.len() < 4 {
                 return None; // need more data for 4-byte header
             }
 
-            let l = u32::from_le_bytes([self.plain_buf[1], self.plain_buf[2], self.plain_buf[3], 0])
-                as usize
-                * 4;
+            let l = u32::from_le_bytes([plain[1], plain[2], plain[3], 0]) as usize * 4;
 
             (l, 4)
         } else {
@@ -158,7 +162,7 @@ impl MsgSplitter {
         }
 
         let total = header_len + payload_len;
-        if self.plain_buf.len() < total {
+        if plain.len() < total {
             None
         } else {
             Some(total)
@@ -168,24 +172,20 @@ impl MsgSplitter {
     /// Intermediate / padded-intermediate transport length parsing.
     ///
     /// 4-byte LE header: payload_len = header & 0x7FFF_FFFF
-    fn intermediate_len(&self) -> Option<usize> {
-        if self.plain_buf.len() < 4 {
+    fn intermediate_len(plain: &[u8]) -> Option<usize> {
+        if plain.len() < 4 {
             return None;
         }
 
-        let payload_len = (u32::from_le_bytes([
-            self.plain_buf[0],
-            self.plain_buf[1],
-            self.plain_buf[2],
-            self.plain_buf[3],
-        ]) & 0x7FFF_FFFF) as usize;
+        let payload_len =
+            (u32::from_le_bytes([plain[0], plain[1], plain[2], plain[3]]) & 0x7FFF_FFFF) as usize;
 
         if payload_len == 0 {
             return Some(0);
         }
 
         let total = 4 + payload_len;
-        if self.plain_buf.len() < total {
+        if plain.len() < total {
             None
         } else {
             Some(total)

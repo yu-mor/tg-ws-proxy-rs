@@ -47,6 +47,24 @@ fn splitter_returns_each_complete_abridged_packet_separately() {
     assert_eq!(parts[1], encrypted_stream[1 + first_payload.len()..]);
 }
 
+#[test]
+fn splitter_disables_after_zero_length_abridged_packet() {
+    let first_payload = b"abcdefgh";
+    let mut plain_stream = Vec::new();
+    plain_stream.push((first_payload.len() / 4) as u8);
+    plain_stream.extend_from_slice(first_payload);
+    plain_stream.push(0);
+    plain_stream.extend_from_slice(b"tail");
+
+    let (relay_init, encrypted_stream) = encrypted_relay_packet(ProtoTag::Abridged, &plain_stream);
+    let mut splitter = MsgSplitter::new(&relay_init, ProtoTag::Abridged);
+
+    let parts = splitter.split(&encrypted_stream);
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0], encrypted_stream[..1 + first_payload.len()]);
+    assert_eq!(parts[1], encrypted_stream[1 + first_payload.len()..]);
+}
+
 fn encrypted_relay_packet(proto: ProtoTag, plain_packet: &[u8]) -> ([u8; 64], Vec<u8>) {
     let secret = test_secret();
     let (handshake, _, _) = generate_client_handshake(&secret, 2, proto);
