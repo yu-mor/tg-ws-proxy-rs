@@ -106,10 +106,11 @@ pub struct Config {
     #[arg(long, default_value = "127.0.0.1", env = "TG_HOST")]
     pub host: String,
 
-    /// MTProto proxy secret (32 hex chars).
+    /// MTProto proxy secret(s) (32 hex chars each).
+    /// Can be specified multiple times or as a comma-separated list.
     /// A random secret is generated if not provided.
-    #[arg(long, env = "TG_SECRET")]
-    pub secret: Option<String>,
+    #[arg(long = "secret", value_delimiter = ',', env = "TG_SECRET")]
+    pub secrets: Vec<String>,
 
     /// Accept inbound Telegram clients using `ee` FakeTLS camouflage with this
     /// SNI hostname. The generated proxy link will use `secret=ee<key><hosthex>`.
@@ -364,9 +365,9 @@ impl Config {
         let mut cfg = Self::parse();
 
         // Fill in a random secret if none was supplied.
-        if cfg.secret.is_none() {
+        if cfg.secrets.is_empty() {
             let bytes: [u8; 16] = rand::random();
-            cfg.secret = Some(hex::encode(bytes));
+            cfg.secrets.push(hex::encode(bytes));
         }
 
         // If no --dc-ip was given, use the built-in defaults — unless a CF
@@ -383,15 +384,33 @@ impl Config {
         cfg
     }
 
-    /// The proxy secret as raw bytes (decoded from hex).
-    pub fn secret_bytes(&self) -> Vec<u8> {
-        let raw =
-            hex::decode(self.secret.as_deref().unwrap_or("")).expect("secret must be valid hex");
+    /// Primary proxy secret (the first configured value).
+    pub fn primary_secret(&self) -> &str {
+        self.secrets.first().map(String::as_str).unwrap_or("")
+    }
+
+    fn normalize_secret_bytes(raw: Vec<u8>) -> Vec<u8> {
         if raw.len() >= 17 && matches!(raw[0], 0xdd | 0xee) {
             raw[1..17].to_vec()
         } else {
             raw
         }
+    }
+
+    /// The proxy secret as raw bytes (decoded from hex).
+    pub fn secret_bytes(&self) -> Vec<u8> {
+        self.secret_bytes_list().into_iter().next().unwrap_or_default()
+    }
+
+    /// All configured proxy secrets as raw bytes.
+    pub fn secret_bytes_list(&self) -> Vec<Vec<u8>> {
+        self.secrets
+            .iter()
+            .map(|s| {
+                let raw = hex::decode(s).expect("secret must be valid hex");
+                Self::normalize_secret_bytes(raw)
+            })
+            .collect()
     }
 
     /// Inbound FakeTLS domain, either from `--listen-faketls-domain` or from
@@ -401,7 +420,7 @@ impl Config {
             return Some(domain.clone());
         }
 
-        let raw = hex::decode(self.secret.as_deref().unwrap_or("")).ok()?;
+        let raw = hex::decode(self.primary_secret()).ok()?;
         if raw.len() > 17 && raw[0] == 0xee {
             return std::str::from_utf8(&raw[17..]).ok().map(ToOwned::to_owned);
         }
@@ -411,7 +430,7 @@ impl Config {
 
     /// Full secret value for the generated Telegram link.
     pub fn link_secret(&self) -> String {
-        let secret = self.secret.as_deref().unwrap_or("");
+        let secret = self.primary_secret();
         if let Some(domain) = self.listen_faketls_domain() {
             let raw = hex::decode(secret).expect("secret must be valid hex");
             let key = if raw.len() >= 17 && matches!(raw[0], 0xdd | 0xee) {

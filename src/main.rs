@@ -173,7 +173,7 @@ async fn main() {
     };
 
     // ── Print startup banner ──────────────────────────────────────────────
-    let secret = config.secret.as_deref().unwrap_or("");
+    let secret = config.primary_secret();
 
     let link_host = config.link_host();
     let tg_link = format!(
@@ -234,6 +234,28 @@ async fn main() {
     info!("{}", "=".repeat(60));
     info!("  Telegram proxy link (use this on all devices):");
     info!("    {}", tg_link);
+    if config.secrets.len() > 1 {
+        info!("  Additional per-user proxy links:");
+        for secret in &config.secrets[1..] {
+            let link_secret = if let Some(domain) = config.listen_faketls_domain() {
+                let raw = hex::decode(secret).expect("secret must be valid hex");
+                let key = if raw.len() >= 17 && matches!(raw[0], 0xdd | 0xee) {
+                    &raw[1..17]
+                } else {
+                    &raw[..]
+                };
+                format!("ee{}{}", hex::encode(key), hex::encode(domain.as_bytes()))
+            } else if secret.starts_with("dd") || secret.starts_with("ee") {
+                secret.to_string()
+            } else {
+                format!("dd{}", secret)
+            };
+            info!(
+                "    tg://proxy?server={}&port={}&secret={}",
+                link_host, config.port, link_secret
+            );
+        }
+    }
 
     if link_host != config.host {
         info!(
