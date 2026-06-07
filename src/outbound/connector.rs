@@ -1,0 +1,163 @@
+use std::net::IpAddr;
+use std::time::Duration;
+
+use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
+use tokio::net::{TcpStream, lookup_host};
+use tokio_socks::TargetAddr;
+use tokio_socks::tcp::Socks5Stream;
+
+use super::config::{OutboundConfig, ProxyConfig, ProxyKind, authority, http_host, target_url};
+
+pub struct OutboundConnector {
+    config: OutboundConfig,
+}
+
+impl OutboundConnector {
+    pub fn direct() -> Self {
+        Self {
+            config: OutboundConfig {
+                proxy: None,
+                no_proxy: None,
+            },
+        }
+    }
+
+    pub fn from_config(
+        outbound_proxy: Option<&str>,
+        no_proxy: Option<&str>,
+        use_env: bool,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            config: OutboundConfig::from_sources(outbound_proxy, no_proxy, use_env)?,
+        })
+    }
+
+    pub fn summary(&self) -> Option<String> {
+        self.config.proxy.as_ref().map(ProxyConfig::summary)
+    }
+
+    pub async fn connect(
+        &self,
+        target_host: &str,
+        target_port: u16,
+        timeout: Duration,
+    ) -> Result<TcpStream, String> {
+        let Some(proxy) = &self.config.proxy else {
+            return connect_direct(target_host, target_port, timeout).await;
+        };
+
+        if self.should_bypass(target_host, target_port) {
+            return connect_direct(target_host, target_port, timeout).await;
+        }
+
+        tokio::time::timeout(timeout, connect_via_proxy(proxy, target_host, target_port))
+            .await
+            .map_err(|_| format!("proxy {} handshake timed out", proxy.summary()))?
+    }
+
+    fn should_bypass(&self, target_host: &str, target_port: u16) -> bool {
+        self.config
+            .no_proxy
+            .as_ref()
+            .is_some_and(|no_proxy| no_proxy.matches(&target_url(target_host, target_port)))
+    }
+}
+
+async fn connect_direct(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, String> {
+    tokio::time::timeout(timeout, connect_tcp(host, port))
+        .await
+        .map_err(|_| "TCP connect timed out".to_string())?
+}
+
+async fn connect_via_proxy(
+    proxy: &ProxyConfig,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream, String> {
+    match proxy.kind {
+        ProxyKind::Http => connect_http_proxy(proxy, target_host, target_port)
+            .await
+            .map_err(|e| format!("HTTP proxy {}: {e}", proxy.summary())),
+        ProxyKind::Socks5 { remote_dns } => {
+            connect_socks5_proxy(proxy, target_host, target_port, remote_dns)
+                .await
+                .map_err(|e| format!("SOCKS5 proxy {}: {e}", proxy.summary()))
+        }
+    }
+}
+
+async fn connect_http_proxy(
+    proxy: &ProxyConfig,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream, String> {
+    let mut stream = connect_tcp(&proxy.host, proxy.port).await?;
+    let target_host = http_host(target_host);
+
+    if let Some(username) = proxy.username.as_deref() {
+        http_connect_tokio_with_basic_auth(
+            &mut stream,
+            &target_host,
+            target_port,
+            username,
+            proxy.password.as_deref().unwrap_or(""),
+        )
+        .await
+    } else {
+        http_connect_tokio(&mut stream, &target_host, target_port).await
+    }
+    .map_err(|e| e.to_string())?;
+
+    Ok(stream)
+}
+
+async fn connect_socks5_proxy(
+    proxy: &ProxyConfig,
+    target_host: &str,
+    target_port: u16,
+    remote_dns: bool,
+) -> Result<TcpStream, String> {
+    let proxy_addr = authority(&proxy.host, proxy.port);
+    let target = socks5_target(target_host, target_port, remote_dns).await?;
+
+    let stream = if let Some(username) = proxy.username.as_deref() {
+        Socks5Stream::connect_with_password(
+            proxy_addr.as_str(),
+            target,
+            username,
+            proxy.password.as_deref().unwrap_or(""),
+        )
+        .await
+    } else {
+        Socks5Stream::connect(proxy_addr.as_str(), target).await
+    }
+    .map_err(|e| e.to_string())?;
+
+    Ok(stream.into_inner())
+}
+
+async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
+    TcpStream::connect(authority(host, port))
+        .await
+        .map_err(|e| format!("TCP connect: {e}"))
+}
+
+async fn socks5_target(
+    host: &str,
+    port: u16,
+    remote_dns: bool,
+) -> Result<TargetAddr<'static>, String> {
+    if remote_dns {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(TargetAddr::Ip((ip, port).into()));
+        }
+        return Ok(TargetAddr::Domain(host.to_string().into(), port));
+    }
+
+    lookup_host((host, port))
+        .await
+        .map_err(|e| format!("SOCKS5 local DNS lookup: {e}"))?
+        .next()
+        .map(TargetAddr::Ip)
+        .ok_or_else(|| "SOCKS5 local DNS lookup returned no addresses".to_string())
+}

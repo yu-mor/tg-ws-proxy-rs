@@ -107,6 +107,9 @@ tg-ws-proxy [OPTIONS]
 | `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` values (see [CF Proxy](#cloudflare-proxy)) |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
+| `--outbound-proxy <URL>` | — | Proxy for all outgoing connections: `http://`, `socks5://`, or `socks5h://`; `https://` proxy URLs are not supported |
+| `--no-outbound-proxy` | off | Ignore standard outbound proxy environment variables |
+| `--no-proxy <LIST>` | — | Comma-separated host bypass list for `--outbound-proxy` |
 | `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
 | `-q / --quiet` | off | Suppress all log output |
 | `-v / --verbose` | off | Debug logging |
@@ -116,7 +119,11 @@ Every flag has a matching environment variable (`TG_PORT`, `TG_HOST`,
 `TG_SECRET`, `TG_BUF_KB`, `TG_POOL_SIZE`, `TG_MAX_CONNECTIONS`, `TG_QUIET`,
 `TG_VERBOSE`, `TG_SKIP_TLS_VERIFY`, `TG_LINK_IP`, `TG_LISTEN_FAKETLS_DOMAIN`, `TG_MTPROTO_PROXY`,
 `TG_LOG_FILE`, `TG_CF_DOMAIN`, `TG_CF_WORKER_DOMAIN`, `TG_CF_PRIORITY`,
-`TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`).
+`TG_CF_BALANCE`, `TG_DEFAULT_DOMAINS`, `TG_OUTBOUND_PROXY`, `TG_NO_OUTBOUND_PROXY`, `TG_NO_PROXY`).
+When `TG_OUTBOUND_PROXY` is not set, standard `HTTPS_PROXY`, `ALL_PROXY`,
+`HTTP_PROXY` and `NO_PROXY` environment variables are also honored. `https://`
+proxy URLs are skipped when discovered from the standard environment if a later
+supported `http://`, `socks5://`, or `socks5h://` fallback is present.
 
 ### Examples
 
@@ -164,6 +171,12 @@ tg-ws-proxy --dc-ip 2:149.154.167.220 --cf-domain yourdomain.com --cf-priority
 tg-ws-proxy \
   --mtproto-proxy proxy.example.com:443:ddabcdef1234567890abcdef1234567890 \
   --mtproto-proxy other.example.net:8888:dddeadbeef01234567deadbeef01234567
+
+# Route all outbound connections through an HTTP CONNECT proxy
+tg-ws-proxy --outbound-proxy http://user:pass@192.168.1.1:3128
+
+# Route all outbound connections through a SOCKS5 proxy with remote DNS
+tg-ws-proxy --outbound-proxy socks5h://user:pass@192.168.1.1:1080
 
 # Router deployment: listen on all interfaces, let all LAN devices use the proxy
 tg-ws-proxy --host 0.0.0.0
@@ -252,6 +265,46 @@ TG_MTPROTO_PROXY="proxy.example.com:443:ddabcdef1234...,other.example.net:8888:d
 > In the `tg://proxy?server=...&secret=` link the `secret=` value already
 > contains the correct prefix.  Copy everything after `secret=` and pass it
 > directly to `--mtproto-proxy`.
+
+### Outbound proxy
+
+If the host running tg-ws-proxy-rs can reach the internet only through another
+proxy, route all outgoing connections through `--outbound-proxy`:
+
+```bash
+tg-ws-proxy --outbound-proxy http://user:pass@192.168.1.1:3128
+tg-ws-proxy --outbound-proxy socks5://user:pass@192.168.1.1:1080
+tg-ws-proxy --outbound-proxy socks5h://user:pass@192.168.1.1:1080
+```
+
+`socks5://` resolves hostnames locally before sending the CONNECT request.
+`socks5h://` sends the hostname to the SOCKS proxy and lets it resolve DNS
+remotely.  The setting applies to direct Telegram WS, Cloudflare proxy,
+Cloudflare Worker, upstream MTProto proxies, direct TCP fallback, `--check`,
+and the `--default-domains` fetch.
+
+The same setting can be supplied through `TG_OUTBOUND_PROXY`.  If it is not
+set, standard `HTTPS_PROXY`, `ALL_PROXY`, `HTTP_PROXY` variables are used in
+that order.  `https://` proxy URLs from those standard environment variables
+are ignored when a later supported fallback exists; an explicit
+`--outbound-proxy https://...` remains an error.
+
+Use `TG_OUTBOUND_PROXY=direct` (also accepts `none` or `off`) or
+`--no-outbound-proxy` to disable environment proxy discovery explicitly. Use
+`--no-proxy` / `TG_NO_PROXY` / `NO_PROXY` to bypass the proxy for specific
+hosts. The bypass list follows standard `NO_PROXY` domain semantics: bare
+domain entries such as `example.com` may match both `example.com` and
+subdomains such as `api.example.com`. It also accepts `*`, suffix entries such
+as `.example.com` or `*.example.com`, IP/CIDR entries such as `127.0.0.0/8`,
+and bracketed IPv6 entries. Host and IP entries may include a port, for example
+`example.com:443` or `[2001:db8::1]:443`; when a port is present, only that
+target port bypasses the proxy.
+
+```bash
+TG_OUTBOUND_PROXY=socks5h://user:pass@192.168.1.1:1080 \
+TG_NO_PROXY=localhost,127.0.0.1,127.0.0.0/8,.lan,example.com:443 \
+tg-ws-proxy
+```
 
 ### Cloudflare Proxy
 
@@ -563,6 +616,9 @@ TG_CF_WORKER_DOMAIN=random-symbols-1234.username.workers.dev
 TG_CF_PRIORITY=false
 TG_CF_BALANCE=false
 TG_DEFAULT_DOMAINS=false
+TG_OUTBOUND_PROXY=socks5h://user:pass@192.168.1.1:1080
+TG_NO_OUTBOUND_PROXY=false
+TG_NO_PROXY=localhost,127.0.0.1
 TG_LOG_FILE=/var/log/tg-ws-proxy.log
 TG_MTPROTO_PROXY=proxy.example.com:443:ddabcdef1234567890abcdef1234567890
 ```

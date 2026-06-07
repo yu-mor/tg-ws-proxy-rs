@@ -31,7 +31,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 use tungstenite::Message;
 
-use crate::config::{Config, default_dc_ips, default_dc_overrides};
+use crate::config::Config;
 use crate::crypto::{
     AesCtr256, ConnectionCiphers, build_connection_ciphers, generate_client_handshake,
     generate_relay_init, parse_handshake,
@@ -41,10 +41,13 @@ use crate::faketls::{
     build_faketls_server_hello, drain_faketls_server_hello, parse_faketls_client_hello,
     read_tls_appdata, read_tls_record, sign_faketls_client_hello, write_tls_appdata,
 };
+use crate::outbound::OutboundConnector;
 use crate::pool::WsPool;
+use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
-    TgWsStream, connect_cf_worker_ws_for_dc, connect_cf_ws_for_dc, connect_ws_for_dc, ws_send,
+    TgWsStream, connect_cf_worker_ws_for_dc_with_outbound, connect_cf_ws_for_dc_with_outbound,
+    connect_ws_for_dc_with_outbound, ws_send,
 };
 
 // WS failure cooldown is global for the process lifetime.
@@ -86,10 +89,10 @@ fn clear_upstream_cooldown(host: &str, port: u16) {
 fn upstream_in_cooldown(host: &str, port: u16) -> bool {
     let key = upstream_key(host, port);
     let lock = UPSTREAM_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_ref() {
-        if let Some(&until) = map.get(&key) {
-            return Instant::now() < until;
-        }
+    if let Some(map) = lock.as_ref()
+        && let Some(&until) = map.get(&key)
+    {
+        return Instant::now() < until;
     }
     false
 }
@@ -146,10 +149,10 @@ fn clear_cf_cooldown(dc: u32, is_media: bool) {
 
 fn cf_in_cooldown(dc: u32, is_media: bool) -> bool {
     let lock = CF_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_ref() {
-        if let Some(&until) = map.get(&(dc, is_media)) {
-            return Instant::now() < until;
-        }
+    if let Some(map) = lock.as_ref()
+        && let Some(&until) = map.get(&(dc, is_media))
+    {
+        return Instant::now() < until;
     }
     false
 }
@@ -206,12 +209,11 @@ fn ws_timeout_for(
     fail_probe_timeout: Duration,
 ) -> Duration {
     let lock = DC_FAIL_UNTIL.lock().unwrap();
-    if let Some(map) = lock.as_ref() {
-        if let Some(&until) = map.get(&(dc, is_media)) {
-            if Instant::now() < until {
-                return fail_probe_timeout; // still in cooldown → try fast
-            }
-        }
+    if let Some(map) = lock.as_ref()
+        && let Some(&until) = map.get(&(dc, is_media))
+        && Instant::now() < until
+    {
+        return fail_probe_timeout; // still in cooldown → try fast
     }
 
     normal_timeout
@@ -337,13 +339,30 @@ pub async fn handle_client(
     config: Config,
     pool: Arc<WsPool>,
 ) {
+    handle_client_with_runtime(
+        stream,
+        peer,
+        config,
+        pool,
+        Arc::new(Runtime::new(OutboundConnector::direct())),
+    )
+    .await;
+}
+
+/// Same as [`handle_client`], but uses the supplied runtime context for shared
+/// outbound routing and DC metadata.
+pub async fn handle_client_with_runtime(
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
+    config: Config,
+    pool: Arc<WsPool>,
+    runtime: Arc<Runtime>,
+) {
     let label = peer.to_string();
     let _ = stream.set_nodelay(true);
 
     let secret = config.secret_bytes();
     let dc_redirects = config.dc_redirects();
-    let dc_overrides = default_dc_overrides();
-    let dc_fallback_ips = default_dc_ips();
     let skip_tls = config.skip_tls_verify;
 
     // ── Timeouts / cooldowns from config ─────────────────────────────────
@@ -418,7 +437,7 @@ pub async fn handle_client(
     let proto = info.proto;
 
     // Apply DC override (e.g. DC 203 → DC 2 for WS domain selection).
-    let ws_dc = *dc_overrides.get(&dc_id).unwrap_or(&dc_id);
+    let ws_dc = runtime.websocket_dc(dc_id);
     let dc_idx: i16 = if is_media {
         -(dc_id as i16)
     } else {
@@ -449,8 +468,8 @@ pub async fn handle_client(
         // CF Worker, CF proxy/default domains, then TCP fallback.  Rust keeps
         // upstream MTProto proxies before TCP as an extra fallback tier.
         let reason = format!("DC{} not in --dc-ip config", dc_id);
-        let fallback = match dc_fallback_ips.get(&dc_id) {
-            Some(ip) => ip.clone(),
+        let fallback = match runtime.fallback_ip(dc_id) {
+            Some(ip) => ip.to_string(),
             None => {
                 warn!("[{}] {} — no fallback IP available", label, reason);
                 return;
@@ -465,13 +484,14 @@ pub async fn handle_client(
                     label, dc_id, media_tag, reason, worker_domain, fallback
                 );
 
-                if let Some(ws) = connect_cf_worker_ws_for_dc(
+                if let Some(ws) = connect_cf_worker_ws_for_dc_with_outbound(
                     worker_domain,
                     &fallback,
                     dc_id,
                     is_media,
                     skip_tls,
                     cf_connect_timeout,
+                    runtime.outbound(),
                 )
                 .await
                 {
@@ -481,7 +501,17 @@ pub async fn handle_client(
                         label, dc_id, media_tag, reason
                     );
                     bridge_ws(
-                        &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
+                        reader,
+                        writer,
+                        WsBridgeParams {
+                            label: &label,
+                            ws,
+                            relay_init,
+                            ciphers,
+                            proto,
+                            dc: dc_id,
+                            is_media,
+                        },
                     )
                     .await;
                     return;
@@ -516,12 +546,13 @@ pub async fn handle_client(
                     label, dc_id, media_tag, reason, cf_domains_for_conn
                 );
 
-                let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc(
+                let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
                     dc_id,
                     &cf_domains_for_conn,
                     is_media,
                     skip_tls,
                     cf_connect_timeout,
+                    runtime.outbound(),
                 )
                 .await;
 
@@ -532,7 +563,17 @@ pub async fn handle_client(
                         label, dc_id, media_tag, reason
                     );
                     bridge_ws(
-                        &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
+                        reader,
+                        writer,
+                        WsBridgeParams {
+                            label: &label,
+                            ws,
+                            relay_init,
+                            ciphers,
+                            proto,
+                            dc: dc_id,
+                            is_media,
+                        },
                     )
                     .await;
                     return;
@@ -571,6 +612,7 @@ pub async fn handle_client(
                 dc_idx,
                 proto,
                 upstream_connect_timeout,
+                runtime.outbound(),
             )
             .await
             {
@@ -599,8 +641,16 @@ pub async fn handle_client(
                                 tg_dec: up_dec,
                             };
                             bridge_mtproto_relay(
-                                &label, reader, writer, rem_reader, rem_writer, up_ciphers, dc_id,
-                                is_media,
+                                reader,
+                                writer,
+                                MtprotoRelayParams {
+                                    label: &label,
+                                    rem_reader,
+                                    rem_writer,
+                                    ciphers: up_ciphers,
+                                    dc: dc_id,
+                                    is_media,
+                                },
                             )
                             .await;
                         }
@@ -612,8 +662,16 @@ pub async fn handle_client(
                                 tg_dec: up_dec,
                             };
                             bridge_faketls_relay(
-                                &label, reader, writer, rem_reader, rem_writer, up_ciphers, dc_id,
-                                is_media,
+                                reader,
+                                writer,
+                                FaketlsRelayParams {
+                                    label: &label,
+                                    rem_reader,
+                                    rem_writer,
+                                    ciphers: up_ciphers,
+                                    dc: dc_id,
+                                    is_media,
+                                },
                             )
                             .await;
                         }
@@ -636,15 +694,18 @@ pub async fn handle_client(
         info!("[{}] {} → TCP fallback {}:443", label, reason, fallback);
 
         bridge_tcp(
-            &label,
             reader,
             writer,
-            &fallback,
-            &relay_init,
-            ciphers,
-            dc_id,
-            is_media,
-            tcp_fallback_timeout,
+            TcpBridgeParams {
+                label: &label,
+                dst: &fallback,
+                relay_init: &relay_init,
+                ciphers,
+                dc: dc_id,
+                is_media,
+                connect_timeout: tcp_fallback_timeout,
+                runtime: Arc::clone(&runtime),
+            },
         )
         .await;
 
@@ -667,12 +728,13 @@ pub async fn handle_client(
                 label, dc_id, media_tag
             );
 
-            let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc(
+            let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
                 dc_id,
                 &cf_domains_for_conn,
                 is_media,
                 skip_tls,
                 cf_connect_timeout,
+                runtime.outbound(),
             )
             .await;
 
@@ -683,7 +745,17 @@ pub async fn handle_client(
                     label, dc_id, media_tag
                 );
                 bridge_ws(
-                    &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
+                    reader,
+                    writer,
+                    WsBridgeParams {
+                        label: &label,
+                        ws,
+                        relay_init,
+                        ciphers,
+                        proto,
+                        dc: dc_id,
+                        is_media,
+                    },
                 )
                 .await;
                 return;
@@ -717,8 +789,15 @@ pub async fn handle_client(
         ws
     } else {
         // ── Step 6b: fresh WebSocket connect ────────────────────────────
-        let (ws_opt, all_redirects) =
-            connect_ws_for_dc(&target_ip, ws_dc, is_media, skip_tls, ws_timeout).await;
+        let (ws_opt, all_redirects) = connect_ws_for_dc_with_outbound(
+            &target_ip,
+            ws_dc,
+            is_media,
+            skip_tls,
+            ws_timeout,
+            runtime.outbound(),
+        )
+        .await;
 
         match ws_opt {
             Some(ws) => {
@@ -763,21 +842,31 @@ pub async fn handle_client(
                             label, dc_id, media_tag, worker_domain, target_ip
                         );
 
-                        if let Some(ws) = connect_cf_worker_ws_for_dc(
+                        if let Some(ws) = connect_cf_worker_ws_for_dc_with_outbound(
                             worker_domain,
                             &target_ip,
                             dc_id,
                             is_media,
                             skip_tls,
                             cf_connect_timeout,
+                            runtime.outbound(),
                         )
                         .await
                         {
                             clear_cf_worker_cooldown(dc_id, is_media);
                             info!("[{}] DC{}{} → CF Worker connected", label, dc_id, media_tag);
                             bridge_ws(
-                                &label, reader, writer, ws, relay_init, ciphers, proto, dc_id,
-                                is_media,
+                                reader,
+                                writer,
+                                WsBridgeParams {
+                                    label: &label,
+                                    ws,
+                                    relay_init,
+                                    ciphers,
+                                    proto,
+                                    dc: dc_id,
+                                    is_media,
+                                },
                             )
                             .await;
                             return;
@@ -813,12 +902,13 @@ pub async fn handle_client(
                             label, dc_id, media_tag
                         );
 
-                        let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc(
+                        let (cf_ws_opt, _all_redirects) = connect_cf_ws_for_dc_with_outbound(
                             dc_id,
                             &cf_domains_for_conn,
                             is_media,
                             skip_tls,
                             cf_connect_timeout,
+                            runtime.outbound(),
                         )
                         .await;
 
@@ -826,8 +916,17 @@ pub async fn handle_client(
                             clear_cf_cooldown(dc_id, is_media);
                             info!("[{}] DC{}{} → CF proxy connected", label, dc_id, media_tag);
                             bridge_ws(
-                                &label, reader, writer, ws, relay_init, ciphers, proto, dc_id,
-                                is_media,
+                                reader,
+                                writer,
+                                WsBridgeParams {
+                                    label: &label,
+                                    ws,
+                                    relay_init,
+                                    ciphers,
+                                    proto,
+                                    dc: dc_id,
+                                    is_media,
+                                },
                             )
                             .await;
                             return;
@@ -866,6 +965,7 @@ pub async fn handle_client(
                         dc_idx,
                         proto,
                         upstream_connect_timeout,
+                        runtime.outbound(),
                     )
                     .await
                     {
@@ -898,8 +998,16 @@ pub async fn handle_client(
                                         tg_dec: up_dec,
                                     };
                                     bridge_mtproto_relay(
-                                        &label, reader, writer, rem_reader, rem_writer, up_ciphers,
-                                        dc_id, is_media,
+                                        reader,
+                                        writer,
+                                        MtprotoRelayParams {
+                                            label: &label,
+                                            rem_reader,
+                                            rem_writer,
+                                            ciphers: up_ciphers,
+                                            dc: dc_id,
+                                            is_media,
+                                        },
                                     )
                                     .await;
                                 }
@@ -916,8 +1024,16 @@ pub async fn handle_client(
                                         tg_dec: up_dec,
                                     };
                                     bridge_faketls_relay(
-                                        &label, reader, writer, rem_reader, rem_writer, up_ciphers,
-                                        dc_id, is_media,
+                                        reader,
+                                        writer,
+                                        FaketlsRelayParams {
+                                            label: &label,
+                                            rem_reader,
+                                            rem_writer,
+                                            ciphers: up_ciphers,
+                                            dc: dc_id,
+                                            is_media,
+                                        },
                                     )
                                     .await;
                                 }
@@ -941,9 +1057,9 @@ pub async fn handle_client(
                     }
                 }
 
-                let fallback = dc_fallback_ips
-                    .get(&dc_id)
-                    .cloned()
+                let fallback = runtime
+                    .fallback_ip(dc_id)
+                    .map(str::to_string)
                     .unwrap_or(target_ip.clone());
 
                 info!(
@@ -952,15 +1068,18 @@ pub async fn handle_client(
                 );
 
                 bridge_tcp(
-                    &label,
                     reader,
                     writer,
-                    &fallback,
-                    &relay_init,
-                    ciphers,
-                    dc_id,
-                    is_media,
-                    tcp_fallback_timeout,
+                    TcpBridgeParams {
+                        label: &label,
+                        dst: &fallback,
+                        relay_init: &relay_init,
+                        ciphers,
+                        dc: dc_id,
+                        is_media,
+                        connect_timeout: tcp_fallback_timeout,
+                        runtime: Arc::clone(&runtime),
+                    },
                 )
                 .await;
 
@@ -971,7 +1090,17 @@ pub async fn handle_client(
 
     // ── Step 7: bidirectional WebSocket bridge ───────────────────────────
     bridge_ws(
-        &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
+        reader,
+        writer,
+        WsBridgeParams {
+            label: &label,
+            ws,
+            relay_init,
+            ciphers,
+            proto,
+            dc: dc_id,
+            is_media,
+        },
     )
     .await;
 }
@@ -985,17 +1114,27 @@ pub async fn handle_client(
 /// client  →  clt_dec  →  plaintext  →  tg_enc  →  split  →  WebSocket frames  →  Telegram
 /// Telegram  →  WS frame  →  tg_dec  →  plaintext  →  clt_enc  →  client TCP
 /// ```
-async fn bridge_ws(
-    label: &str,
-    reader: ClientReader,
-    writer: ClientWriter,
-    mut ws: TgWsStream,
+struct WsBridgeParams<'a> {
+    label: &'a str,
+    ws: TgWsStream,
     relay_init: [u8; 64],
-    ciphers: crate::crypto::ConnectionCiphers,
+    ciphers: ConnectionCiphers,
     proto: crate::crypto::ProtoTag,
     dc: u32,
     is_media: bool,
-) {
+}
+
+async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeParams<'_>) {
+    let WsBridgeParams {
+        label,
+        mut ws,
+        relay_init,
+        ciphers,
+        proto,
+        dc,
+        is_media,
+    } = params;
+
     // Send the relay init packet to Telegram before bridging.
     if let Err(e) = ws_send(&mut ws, relay_init.to_vec()).await {
         warn!("[{}] failed to send relay init: {}", label, e);
@@ -1097,18 +1236,18 @@ async fn bridge_ws(
     // its I/O handles (and file descriptors) are released immediately.
     let (bytes_up, bytes_down) = tokio::select! {
         result = &mut upload => {
-            let up = result.unwrap_or_else(|_| 0);
+            let up = result.unwrap_or(0);
             download.abort();
 
-            let down = download.await.unwrap_or_else(|_| 0);
+            let down = download.await.unwrap_or(0);
 
             (up, down)
         }
         result = &mut download => {
-            let down = result.unwrap_or_else(|_| 0);
+            let down = result.unwrap_or(0);
             upload.abort();
 
-            let up = upload.await.unwrap_or_else(|_| 0);
+            let up = upload.await.unwrap_or(0);
 
             (up, down)
         }
@@ -1165,6 +1304,7 @@ async fn connect_mtproto_upstream(
     dc_idx: i16,
     proto: crate::crypto::ProtoTag,
     timeout: Duration,
+    outbound: &crate::outbound::OutboundConnector,
 ) -> Option<UpstreamConnection> {
     let secret = match hex::decode(secret_hex) {
         Ok(b) => b,
@@ -1187,19 +1327,13 @@ async fn connect_mtproto_upstream(
     };
 
     // ── TCP connect ───────────────────────────────────────────────────────
-    let stream =
-        match tokio::time::timeout(timeout, TcpStream::connect(format!("{}:{}", host, port))).await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                warn!("[upstream] {}:{} connect error: {}", host, port, e);
-                return None;
-            }
-            Err(_) => {
-                warn!("[upstream] {}:{} connect timed out", host, port);
-                return None;
-            }
-        };
+    let stream = match outbound.connect(host, port, timeout).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("[upstream] {}:{} connect error: {}", host, port, e);
+            return None;
+        }
+    };
     let _ = stream.set_nodelay(true);
 
     let (handshake, enc, dec) = generate_client_handshake(key_bytes, dc_idx, proto);
@@ -1267,16 +1401,29 @@ async fn connect_mtproto_upstream(
 ///
 /// `ciphers.tg_enc` / `ciphers.tg_dec` must already be set to the upstream
 /// session ciphers returned by [`connect_mtproto_upstream`].
-async fn bridge_mtproto_relay(
-    label: &str,
-    reader: ClientReader,
-    writer: ClientWriter,
+struct MtprotoRelayParams<'a> {
+    label: &'a str,
     rem_reader: tokio::io::ReadHalf<TcpStream>,
-    mut rem_writer: tokio::io::WriteHalf<TcpStream>,
+    rem_writer: tokio::io::WriteHalf<TcpStream>,
     ciphers: ConnectionCiphers,
     dc: u32,
     is_media: bool,
+}
+
+async fn bridge_mtproto_relay(
+    reader: ClientReader,
+    writer: ClientWriter,
+    params: MtprotoRelayParams<'_>,
 ) {
+    let MtprotoRelayParams {
+        label,
+        rem_reader,
+        mut rem_writer,
+        ciphers,
+        dc,
+        is_media,
+    } = params;
+
     let ConnectionCiphers {
         mut clt_dec,
         mut clt_enc,
@@ -1370,16 +1517,29 @@ async fn bridge_mtproto_relay(
 ///
 /// The AES-CTR re-encryption (`clt_dec` / `tg_enc` and `tg_dec` / `clt_enc`)
 /// operates on the payload inside TLS records, exactly as in the plain bridge.
-async fn bridge_faketls_relay(
-    label: &str,
-    reader: ClientReader,
-    writer: ClientWriter,
+struct FaketlsRelayParams<'a> {
+    label: &'a str,
     rem_reader: tokio::io::ReadHalf<TcpStream>,
     rem_writer: tokio::io::WriteHalf<TcpStream>,
     ciphers: ConnectionCiphers,
     dc: u32,
     is_media: bool,
+}
+
+async fn bridge_faketls_relay(
+    reader: ClientReader,
+    writer: ClientWriter,
+    params: FaketlsRelayParams<'_>,
 ) {
+    let FaketlsRelayParams {
+        label,
+        rem_reader,
+        rem_writer,
+        ciphers,
+        dc,
+        is_media,
+    } = params;
+
     let ConnectionCiphers {
         mut clt_dec,
         mut clt_enc,
@@ -1473,31 +1633,40 @@ async fn bridge_faketls_relay(
 /// Connect directly to `dst:443` and bridge the re-encrypted streams.
 ///
 /// Logs a session-close line on return (matching the `bridge_ws` format).
-async fn bridge_tcp(
-    label: &str,
-    mut reader: ClientReader,
-    mut writer: ClientWriter,
-    dst: &str,
-    relay_init: &[u8; 64],
+struct TcpBridgeParams<'a> {
+    label: &'a str,
+    dst: &'a str,
+    relay_init: &'a [u8; 64],
     ciphers: crate::crypto::ConnectionCiphers,
     dc: u32,
     is_media: bool,
     connect_timeout: Duration,
+    runtime: Arc<Runtime>,
+}
+
+async fn bridge_tcp(
+    mut reader: ClientReader,
+    mut writer: ClientWriter,
+    params: TcpBridgeParams<'_>,
 ) {
-    let remote =
-        match tokio::time::timeout(connect_timeout, TcpStream::connect(format!("{}:443", dst)))
-            .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                warn!("[{}] TCP fallback connect failed: {}", label, e);
-                return;
-            }
-            Err(_) => {
-                warn!("[{}] TCP fallback connect timed out", label);
-                return;
-            }
-        };
+    let TcpBridgeParams {
+        label,
+        dst,
+        relay_init,
+        ciphers,
+        dc,
+        is_media,
+        connect_timeout,
+        runtime,
+    } = params;
+
+    let remote = match runtime.outbound().connect(dst, 443, connect_timeout).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("[{}] TCP fallback connect failed: {}", label, e);
+            return;
+        }
+    };
 
     let _ = remote.set_nodelay(true);
     let (mut rem_reader, mut rem_writer) = tokio::io::split(remote);
@@ -1568,18 +1737,18 @@ async fn bridge_tcp(
     // when one direction closes so FDs are freed immediately.
     let (bytes_up, bytes_down) = tokio::select! {
         result = &mut upload => {
-            let up = result.unwrap_or_else(|_| 0);
+            let up = result.unwrap_or(0);
             download.abort();
 
-            let down = download.await.unwrap_or_else(|_| 0);
+            let down = download.await.unwrap_or(0);
 
             (up, down)
         }
         result = &mut download => {
-            let down = result.unwrap_or_else(|_| 0);
+            let down = result.unwrap_or(0);
             upload.abort();
 
-            let up = upload.await.unwrap_or_else(|_| 0);
+            let up = upload.await.unwrap_or(0);
 
             (up, down)
         }

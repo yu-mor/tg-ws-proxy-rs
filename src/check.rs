@@ -25,12 +25,14 @@
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 
 use crate::config::{Config, MtProtoProxy, default_dc_ips};
 use crate::crypto::{ProtoTag, generate_client_handshake};
 use crate::faketls;
-use crate::ws_client::{connect_cf_worker_ws_for_dc, connect_cf_ws_for_dc};
+use crate::outbound::OutboundConnector;
+use crate::ws_client::{
+    connect_cf_worker_ws_for_dc_with_outbound, connect_cf_ws_for_dc_with_outbound,
+};
 
 // ─── Probe result ─────────────────────────────────────────────────────────────
 
@@ -66,9 +68,22 @@ impl ProbeStatus {
 /// DC 2 is used as a representative data-centre — if the domain is correctly
 /// configured in Cloudflare (`kws2.{domain}` A record, orange-cloud, Flexible
 /// SSL), this probe will succeed and other DCs should work too.
-async fn probe_cf_domain(domain: &str, skip_tls: bool, timeout: Duration) -> ProbeStatus {
+async fn probe_cf_domain(
+    domain: &str,
+    skip_tls: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> ProbeStatus {
     let start = Instant::now();
-    let (ws, _) = connect_cf_ws_for_dc(2, &[domain.to_string()], false, skip_tls, timeout).await;
+    let (ws, _) = connect_cf_ws_for_dc_with_outbound(
+        2,
+        &[domain.to_string()],
+        false,
+        skip_tls,
+        timeout,
+        outbound,
+    )
+    .await;
     if ws.is_some() {
         ProbeStatus::Ok(start.elapsed())
     } else {
@@ -79,13 +94,21 @@ async fn probe_cf_domain(domain: &str, skip_tls: bool, timeout: Duration) -> Pro
 }
 
 /// Probe a Cloudflare Worker by opening its WebSocket tunnel to DC 2.
-async fn probe_cf_worker(domain: &str, skip_tls: bool, timeout: Duration) -> ProbeStatus {
+async fn probe_cf_worker(
+    domain: &str,
+    skip_tls: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> ProbeStatus {
     let Some(dst) = default_dc_ips().get(&2).cloned() else {
         return ProbeStatus::Fail("DC 2 default IP is missing".to_string());
     };
 
     let start = Instant::now();
-    let ws = connect_cf_worker_ws_for_dc(domain, &dst, 2, false, skip_tls, timeout).await;
+    let ws = connect_cf_worker_ws_for_dc_with_outbound(
+        domain, &dst, 2, false, skip_tls, timeout, outbound,
+    )
+    .await;
     if ws.is_some() {
         ProbeStatus::Ok(start.elapsed())
     } else {
@@ -101,7 +124,11 @@ async fn probe_cf_worker(domain: &str, skip_tls: bool, timeout: Duration) -> Pro
 /// For FakeTLS proxies the probe also drains the server's fake TLS handshake,
 /// verifying end-to-end protocol negotiation.  For plain proxies a successful
 /// TCP connect + handshake send is sufficient to confirm reachability.
-async fn probe_mtproto_proxy(proxy: &MtProtoProxy, timeout: Duration) -> ProbeStatus {
+async fn probe_mtproto_proxy(
+    proxy: &MtProtoProxy,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> ProbeStatus {
     let secret = match hex::decode(&proxy.secret) {
         Ok(b) => b,
         Err(e) => return ProbeStatus::Fail(format!("invalid hex secret: {}", e)),
@@ -117,15 +144,9 @@ async fn probe_mtproto_proxy(proxy: &MtProtoProxy, timeout: Duration) -> ProbeSt
     let start = Instant::now();
 
     // ── TCP connect ───────────────────────────────────────────────────────
-    let stream = match tokio::time::timeout(
-        timeout,
-        TcpStream::connect(format!("{}:{}", proxy.host, proxy.port)),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return ProbeStatus::Fail(format!("TCP connect failed: {}", e)),
-        Err(_) => return ProbeStatus::Fail("TCP connect timed out".to_string()),
+    let stream = match outbound.connect(&proxy.host, proxy.port, timeout).await {
+        Ok(s) => s,
+        Err(e) => return ProbeStatus::Fail(format!("TCP connect failed: {}", e)),
     };
     let _ = stream.set_nodelay(true);
 
@@ -195,6 +216,19 @@ fn proxy_kind(proxy: &MtProtoProxy) -> &'static str {
 /// Prints a human-readable report to stdout.  Returns `true` when every probe
 /// passed so that the caller can exit with the appropriate status code.
 pub async fn run_check(config: &Config) -> bool {
+    let outbound = match config.outbound_connector() {
+        Ok(outbound) => outbound,
+        Err(e) => {
+            eprintln!("Invalid outbound proxy configuration: {e}");
+            return false;
+        }
+    };
+    run_check_with_outbound(config, &outbound).await
+}
+
+/// Same as [`run_check`], but uses a pre-built outbound connector so callers
+/// can share proxy configuration across runtime components.
+pub async fn run_check_with_outbound(config: &Config, outbound: &OutboundConnector) -> bool {
     let cf_timeout = Duration::from_secs(config.cf_connect_timeout);
     let upstream_timeout = Duration::from_secs(config.upstream_connect_timeout);
     let skip_tls = config.skip_tls_verify;
@@ -229,7 +263,7 @@ pub async fn run_check(config: &Config) -> bool {
             // Flush so the user sees the label before the potentially slow probe.
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
-            let status = probe_cf_domain(domain, skip_tls, cf_timeout).await;
+            let status = probe_cf_domain(domain, skip_tls, cf_timeout, outbound).await;
             println!("[{}]  {}", status.marker(), status.detail());
 
             if !status.is_ok() {
@@ -245,7 +279,7 @@ pub async fn run_check(config: &Config) -> bool {
         print!("  {:40}  ... ", domain);
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
-        let status = probe_cf_worker(&domain, skip_tls, cf_timeout).await;
+        let status = probe_cf_worker(&domain, skip_tls, cf_timeout, outbound).await;
         println!("[{}]  {}", status.marker(), status.detail());
 
         if !status.is_ok() {
@@ -263,7 +297,7 @@ pub async fn run_check(config: &Config) -> bool {
             print!("  {:40}  ... ", label);
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
-            let status = probe_mtproto_proxy(proxy, upstream_timeout).await;
+            let status = probe_mtproto_proxy(proxy, upstream_timeout, outbound).await;
             println!("[{}]  {}", status.marker(), status.detail());
 
             if !status.is_ok() {
