@@ -399,7 +399,8 @@ impl Config {
 
     /// The proxy secret as raw bytes (decoded from hex).
     pub fn secret_bytes(&self) -> Vec<u8> {
-        self.secret_bytes_list().into_iter().next().unwrap_or_default()
+        let raw = hex::decode(self.primary_secret()).expect("secret must be valid hex");
+        Self::normalize_secret_bytes(raw)
     }
 
     /// All configured proxy secrets as raw bytes.
@@ -430,7 +431,11 @@ impl Config {
 
     /// Full secret value for the generated Telegram link.
     pub fn link_secret(&self) -> String {
-        let secret = self.primary_secret();
+        self.link_secret_for(self.primary_secret())
+    }
+
+    /// Full secret value for the generated Telegram link for any configured secret.
+    pub fn link_secret_for(&self, secret: &str) -> String {
         if let Some(domain) = self.listen_faketls_domain() {
             let raw = hex::decode(secret).expect("secret must be valid hex");
             let key = if raw.len() >= 17 && matches!(raw[0], 0xdd | 0xee) {
