@@ -20,6 +20,7 @@
 //!           [bridge_tcp]  →  direct TCP to Telegram DC IP:443
 //! ```
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,6 +99,8 @@ fn upstream_in_cooldown(host: &str, port: u16) -> bool {
 
 /// Round-robin counter for CF domain balancing (`--cf-balance`).
 static CF_BALANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+/// Round-robin counter for CF Worker domain balancing (`--cf-balance`).
+static CF_WORKER_BALANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Return a rotated view of `cf_domains` based on a global round-robin counter.
 ///
@@ -124,10 +127,24 @@ fn balanced_cf_domains(cf_domains: &[String]) -> Vec<String> {
     result
 }
 
+/// Return a rotated view of `cf_worker_domains` for Worker load balancing.
+fn balanced_cf_workers(cf_worker_domains: &[String]) -> Vec<String> {
+    let n = cf_worker_domains.len();
+    if n <= 1 {
+        return cf_worker_domains.to_vec();
+    }
+    let idx = CF_WORKER_BALANCE_COUNTER.fetch_add(1, Ordering::Relaxed) % n;
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        result.push(cf_worker_domains[(idx + i) % n].clone());
+    }
+    result
+}
+
 /// Per-DC cooldown for the CF proxy path.
 static CF_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
-/// Per-DC cooldown for the Cloudflare Worker path.
-static CF_WORKER_FAIL_UNTIL: StdMutex<Option<HashMap<(u32, bool), Instant>>> = StdMutex::new(None);
+/// Per-Worker cooldown for the Cloudflare Worker path.
+static CF_WORKER_FAIL_UNTIL: StdMutex<Option<HashMap<String, Instant>>> = StdMutex::new(None);
 type TcpReader = ReadHalf<TcpStream>;
 type TcpWriter = WriteHalf<TcpStream>;
 
@@ -154,23 +171,23 @@ fn cf_in_cooldown(dc: u32, is_media: bool) -> bool {
     false
 }
 
-fn set_cf_worker_cooldown(dc: u32, is_media: bool, cooldown: Duration) {
+fn set_cf_worker_cooldown(worker_domain: &str, cooldown: Duration) {
     let mut lock = CF_WORKER_FAIL_UNTIL.lock().unwrap();
     lock.get_or_insert_with(HashMap::new)
-        .insert((dc, is_media), Instant::now() + cooldown);
+        .insert(worker_domain.to_string(), Instant::now() + cooldown);
 }
 
-fn clear_cf_worker_cooldown(dc: u32, is_media: bool) {
+fn clear_cf_worker_cooldown(worker_domain: &str) {
     let mut lock = CF_WORKER_FAIL_UNTIL.lock().unwrap();
     if let Some(map) = lock.as_mut() {
-        map.remove(&(dc, is_media));
+        map.remove(worker_domain);
     }
 }
 
-fn cf_worker_in_cooldown(dc: u32, is_media: bool) -> bool {
+fn cf_worker_in_cooldown(worker_domain: &str) -> bool {
     let lock = CF_WORKER_FAIL_UNTIL.lock().unwrap();
     if let Some(map) = lock.as_ref()
-        && let Some(&until) = map.get(&(dc, is_media))
+        && let Some(&until) = map.get(worker_domain)
     {
         return Instant::now() < until;
     }
@@ -441,7 +458,7 @@ pub async fn handle_client(
 
     // ── Step 5: route the connection ──────────────────────────────────────
     let target_ip = dc_redirects.get(&dc_id).cloned();
-    let cf_worker_domain = config.cf_worker_domain();
+    let cf_worker_domains = config.cf_worker_domains();
     let media_tag = if is_media { "m" } else { "" };
 
     if target_ip.is_none() {
@@ -458,8 +475,21 @@ pub async fn handle_client(
         };
 
         // ── Try Cloudflare Worker if configured ──────────────────────────
-        if let Some(worker_domain) = cf_worker_domain.as_deref() {
-            if !cf_worker_in_cooldown(dc_id, is_media) {
+        if !cf_worker_domains.is_empty() {
+            let workers_for_conn: Cow<'_, [String]> = if config.cf_balance {
+                Cow::Owned(balanced_cf_workers(&cf_worker_domains))
+            } else {
+                Cow::Borrowed(&cf_worker_domains)
+            };
+            for worker_domain in workers_for_conn.iter() {
+                if cf_worker_in_cooldown(worker_domain) {
+                    debug!(
+                        "[{}] DC{}{} CF Worker {} in cooldown, skipping",
+                        label, dc_id, media_tag, worker_domain
+                    );
+                    continue;
+                }
+
                 debug!(
                     "[{}] DC{}{} {} → trying CF Worker {} for {}",
                     label, dc_id, media_tag, reason, worker_domain, fallback
@@ -475,10 +505,10 @@ pub async fn handle_client(
                 )
                 .await
                 {
-                    clear_cf_worker_cooldown(dc_id, is_media);
+                    clear_cf_worker_cooldown(worker_domain);
                     info!(
-                        "[{}] DC{}{} {} → CF Worker connected",
-                        label, dc_id, media_tag, reason
+                        "[{}] DC{}{} {} → CF Worker connected ({})",
+                        label, dc_id, media_tag, reason, worker_domain
                     );
                     bridge_ws(
                         &label, reader, writer, ws, relay_init, ciphers, proto, dc_id, is_media,
@@ -486,20 +516,16 @@ pub async fn handle_client(
                     .await;
                     return;
                 } else {
-                    set_cf_worker_cooldown(dc_id, is_media, cf_fail_cooldown);
+                    set_cf_worker_cooldown(worker_domain, cf_fail_cooldown);
                     warn!(
-                        "[{}] DC{}{} CF Worker failed, cooldown {}s",
+                        "[{}] DC{}{} CF Worker {} failed, cooldown {}s",
                         label,
                         dc_id,
                         media_tag,
+                        worker_domain,
                         cf_fail_cooldown.as_secs()
                     );
                 }
-            } else {
-                debug!(
-                    "[{}] DC{}{} CF Worker in cooldown, skipping",
-                    label, dc_id, media_tag
-                );
             }
         }
 
@@ -756,8 +782,21 @@ pub async fn handle_client(
                 }
 
                 // ── Try Cloudflare Worker if configured ──────────────────
-                if let Some(worker_domain) = cf_worker_domain.as_deref() {
-                    if !cf_worker_in_cooldown(dc_id, is_media) {
+                if !cf_worker_domains.is_empty() {
+                    let workers_for_conn: Cow<'_, [String]> = if config.cf_balance {
+                        Cow::Owned(balanced_cf_workers(&cf_worker_domains))
+                    } else {
+                        Cow::Borrowed(&cf_worker_domains)
+                    };
+                    for worker_domain in workers_for_conn.iter() {
+                        if cf_worker_in_cooldown(worker_domain) {
+                            debug!(
+                                "[{}] DC{}{} CF Worker {} in cooldown, skipping",
+                                label, dc_id, media_tag, worker_domain
+                            );
+                            continue;
+                        }
+
                         debug!(
                             "[{}] DC{}{} WS failed → trying CF Worker {} for {}",
                             label, dc_id, media_tag, worker_domain, target_ip
@@ -773,8 +812,11 @@ pub async fn handle_client(
                         )
                         .await
                         {
-                            clear_cf_worker_cooldown(dc_id, is_media);
-                            info!("[{}] DC{}{} → CF Worker connected", label, dc_id, media_tag);
+                            clear_cf_worker_cooldown(worker_domain);
+                            info!(
+                                "[{}] DC{}{} → CF Worker connected ({})",
+                                label, dc_id, media_tag, worker_domain
+                            );
                             bridge_ws(
                                 &label, reader, writer, ws, relay_init, ciphers, proto, dc_id,
                                 is_media,
@@ -782,20 +824,16 @@ pub async fn handle_client(
                             .await;
                             return;
                         } else {
-                            set_cf_worker_cooldown(dc_id, is_media, cf_fail_cooldown);
+                            set_cf_worker_cooldown(worker_domain, cf_fail_cooldown);
                             warn!(
-                                "[{}] DC{}{} CF Worker failed, cooldown {}s",
+                                "[{}] DC{}{} CF Worker {} failed, cooldown {}s",
                                 label,
                                 dc_id,
                                 media_tag,
+                                worker_domain,
                                 cf_fail_cooldown.as_secs()
                             );
                         }
-                    } else {
-                        debug!(
-                            "[{}] DC{}{} CF Worker in cooldown, skipping",
-                            label, dc_id, media_tag
-                        );
                     }
                 }
 
@@ -1644,4 +1682,60 @@ fn human_bytes(n: u64) -> String {
     }
 
     format!("{:.1}PB", v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn balanced_cf_workers_rotates_start_domain() {
+        CF_WORKER_BALANCE_COUNTER.store(0, Ordering::Relaxed);
+        let workers = vec![
+            "w1.example.workers.dev".to_string(),
+            "w2.example.workers.dev".to_string(),
+            "w3.example.workers.dev".to_string(),
+        ];
+
+        assert_eq!(
+            balanced_cf_workers(&workers),
+            vec![
+                "w1.example.workers.dev".to_string(),
+                "w2.example.workers.dev".to_string(),
+                "w3.example.workers.dev".to_string(),
+            ]
+        );
+        assert_eq!(
+            balanced_cf_workers(&workers),
+            vec![
+                "w2.example.workers.dev".to_string(),
+                "w3.example.workers.dev".to_string(),
+                "w1.example.workers.dev".to_string(),
+            ]
+        );
+        assert_eq!(
+            balanced_cf_workers(&workers),
+            vec![
+                "w3.example.workers.dev".to_string(),
+                "w1.example.workers.dev".to_string(),
+                "w2.example.workers.dev".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn worker_cooldown_is_tracked_per_domain() {
+        clear_cf_worker_cooldown("w1.example.workers.dev");
+        clear_cf_worker_cooldown("w2.example.workers.dev");
+
+        assert!(!cf_worker_in_cooldown("w1.example.workers.dev"));
+        assert!(!cf_worker_in_cooldown("w2.example.workers.dev"));
+
+        set_cf_worker_cooldown("w1.example.workers.dev", Duration::from_secs(60));
+        assert!(cf_worker_in_cooldown("w1.example.workers.dev"));
+        assert!(!cf_worker_in_cooldown("w2.example.workers.dev"));
+
+        clear_cf_worker_cooldown("w1.example.workers.dev");
+        assert!(!cf_worker_in_cooldown("w1.example.workers.dev"));
+    }
 }

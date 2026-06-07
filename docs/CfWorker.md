@@ -32,6 +32,7 @@ workers.dev
 
 7. Скопируйте домен из поля справа и укажите его в настройках **Cloudflare Worker** (или через аргумент `--cf-worker-domain`; совместимое имя из Python `--cfproxy-worker-domain` тоже поддерживается)
     * Пример домена: `random-symbols-1234.username.workers.dev`
+    * Можно указать несколько доменов (через запятую или повторяя `--cf-worker-domain`); с `--cf-balance` они будут использоваться в round-robin и с failover на следующий Worker.
    <img width="414" height="182" alt="image" src="https://github.com/user-attachments/assets/4fb0b111-8026-4d17-b993-6c70ec37f1f5" />
 
 В Docker / systemd можно использовать переменную окружения:
