@@ -18,7 +18,7 @@ jobs:
             - name: Install Toolchain & Tooling
               run: |
                 sudo apt-get update
-                sudo apt-get install -y musl-tools
+                sudo apt-get install -y gcc-mipsel-linux-gnu musl-tools
                 rustup default nightly
                 rustup component add rust-src --toolchain nightly
 
@@ -41,6 +41,9 @@ jobs:
               env:
                   ring_core_no_asm: 1
                   AWS_LC_SYS_NO_ASM: 1
+                  CC_mipsel_unknown_linux_musl: mipsel-linux-gnu-gcc
+                  CC: mipsel-linux-gnu-gcc
+                  RUSTFLAGS: "-C opt-level=z -C panic=abort"
               run: |
                 cargo build --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
 
