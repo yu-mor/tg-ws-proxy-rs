@@ -31,6 +31,7 @@ jobs:
                 rustflags = [
                   "-C", "target-feature=+crt-static",
                   "-C", "link-arg=-static",
+                  "-C", "link-arg=-msoft-float",
                   "-C", "link-arg=-mno-dsp",
                   "-C", "link-arg=-march=mips32r2",
                   "-C", "strip=symbols"
@@ -41,11 +42,9 @@ jobs:
               env:
                   ring_core_no_asm: 1
                   AWS_LC_SYS_NO_ASM: 1
-                  CC_mipsel_unknown_linux_musl: mipsel-linux-gnu-gcc
-                  CC: mipsel-linux-gnu-gcc
-                  # Указываем пути к musl-заголовкам Ubuntu, чтобы линкер увидел libc.a и crt1.o
-                  STAGING_DIR: /usr/mipsel-linux-gnu
-                  RUSTFLAGS: "-C opt-level=z -C panic=abort"
+                  CC_mipsel_unknown_linux_musl: mipsel-linux-gnu-gcc -msoft-float
+                  CC: mipsel-linux-gnu-gcc -msoft-float
+                  RUSTFLAGS: "-C opt-level=z -C panic=abort -C target-feature=+crt-static"
               run: |
                 cargo build --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
 
