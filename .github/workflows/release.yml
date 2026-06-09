@@ -24,7 +24,7 @@ jobs:
             matrix:
                 include:
                      - target: mipsel-unknown-linux-musl
-                      os: ubuntu-latest
+                       os: ubuntu-latest
 
         runs-on: ${{ matrix.os }}
         steps:
