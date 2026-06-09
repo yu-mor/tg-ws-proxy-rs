@@ -23,39 +23,34 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - target: mipsel-unknown-linux-gnu
+                    - target: mipsel-unknown-linux-musl
                       os: ubuntu-latest
         runs-on: ${{ matrix.os }}
         steps:
             - uses: actions/checkout@v6
 
             - name: Install nightly + rust-src (mipsel)
-              if: matrix.target == 'mipsel-unknown-linux-gnu'
               uses: dtolnay/rust-toolchain@nightly
               with:
                   components: rust-src
 
             - name: Install cross (mipsel)
-              if: matrix.target == 'mipsel-unknown-linux-gnu'
               run: cargo install cross --locked
 
-            - name: Build (mipsel, build-std)
-              if: matrix.target == 'mipsel-unknown-linux-gnu'
+            - name: Build (mipsel-musl static)
               env:
                   ring_core_no_asm: 1
                   AWS_LC_SYS_NO_ASM: 1
                   RUSTFLAGS: "-C target-feature=+crt-static"
-              run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-gnu -Z build-std=std,panic_abort
+              run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
 
             - name: Inspect build output (mipsel)
-              if: matrix.target == 'mipsel-unknown-linux-gnu'
               run: |
                   FILE="target/${{ matrix.target }}/release/tg-ws-proxy"
                   ls -lah "target/${{ matrix.target }}/release/" || true
                   test -f "$FILE"
 
             - name: Upload to GitHub Release (mipsel)
-              if: matrix.target == 'mipsel-unknown-linux-gnu'
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
               shell: bash
