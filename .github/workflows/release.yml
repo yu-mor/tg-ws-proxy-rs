@@ -1,4 +1,4 @@
-name: Release
+ame: Release
 
 permissions:
     contents: write
@@ -21,7 +21,7 @@ jobs:
                 rustup component add rust-src --toolchain nightly
 
             - name: Install Zig Compiler
-              uses: mitchellh/setup-zig@v1
+              uses: mlugg/setup-zig@v2
               with:
                 version: 0.13.0
 
