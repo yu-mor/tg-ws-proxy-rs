@@ -22,15 +22,15 @@ jobs:
                 rustup default nightly
                 rustup component add rust-src --toolchain nightly
 
-            - name: Configure Cargo Linker (LLVM LLD)
+            - name: Configure Cargo Linker
               run: |
                 mkdir -p .cargo
                 cat << 'EOF' > .cargo/config.toml
                 [target.mipsel-unknown-linux-musl]
-                linker = "rust-lld"
+                linker = "mipsel-linux-gnu-gcc"
                 rustflags = [
                   "-C", "target-feature=+crt-static",
-                  "-C", "link-self-contained=yes",
+                  "-C", "link-arg=-static",
                   "-C", "link-arg=-mno-dsp",
                   "-C", "link-arg=-march=mips32r2",
                   "-C", "strip=symbols"
