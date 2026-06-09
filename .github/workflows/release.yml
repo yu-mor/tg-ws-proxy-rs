@@ -15,10 +15,10 @@ jobs:
             - name: Checkout code
               uses: actions/checkout@v4
 
-            - name: Install Toolchain & Tooling
+            - name: Install Toolchain & Cross-Compiler
               run: |
                 sudo apt-get update
-                sudo apt-get install -y gcc-mipsel-linux-gnu musl-tools
+                sudo apt-get install -y gcc-mipsel-linux-gnu musl-tools musl-dev
                 rustup default nightly
                 rustup component add rust-src --toolchain nightly
 
@@ -43,6 +43,8 @@ jobs:
                   AWS_LC_SYS_NO_ASM: 1
                   CC_mipsel_unknown_linux_musl: mipsel-linux-gnu-gcc
                   CC: mipsel-linux-gnu-gcc
+                  # Указываем пути к musl-заголовкам Ubuntu, чтобы линкер увидел libc.a и crt1.o
+                  STAGING_DIR: /usr/mipsel-linux-gnu
                   RUSTFLAGS: "-C opt-level=z -C panic=abort"
               run: |
                 cargo build --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
