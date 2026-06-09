@@ -59,7 +59,7 @@ webpki-roots = "0.26"
 tokio-rustls = "0.26"
 
 [profile.release]
-opt-level = 3
+opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
