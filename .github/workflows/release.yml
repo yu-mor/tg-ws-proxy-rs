@@ -9,66 +9,72 @@ on:
             - v[0-9]+.*
 
 jobs:
-    build-and-release:
+    create-release:
         runs-on: ubuntu-latest
         steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
-
-            - name: Install Rust Toolchain
-              run: |
-                rustup default nightly
-                rustup component add rust-src --toolchain nightly
-
-            - name: Install Zig Compiler
-              uses: mlugg/setup-zig@v2
+            - uses: actions/checkout@v6
+            - uses: taiki-e/create-gh-release-action@v1
               with:
-                version: 0.13.0
+                  token: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Configure Cargo Linker (Zig CC)
+    upload-assets:
+        needs: create-release
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                     - target: mipsel-unknown-linux-musl
+                      os: ubuntu-latest
+
+        runs-on: ${{ matrix.os }}
+        steps:
+            - uses: actions/checkout@v6
+
+            # Default path (all targets except mipsel)
+            - name: Build & upload (default)
+              if: matrix.target != 'mipsel-unknown-linux-musl' && matrix.target != 'mips-unknown-linux-musl'
+              uses: taiki-e/upload-rust-binary-action@v1
+              with:
+                  bin: tg-ws-proxy
+                  target: ${{ matrix.target }}
+                  token: ${{ secrets.GITHUB_TOKEN }}
+
+            # Special path for mipsel: nightly + build-std, then upload via gh cli
+            - name: Install nightly + rust-src (mipsel and mips)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
+              uses: dtolnay/rust-toolchain@nightly
+              with:
+                  components: rust-src
+
+            - name: Install cross (mipsel and mips)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
+              run: cargo install cross --locked
+
+            - name: Build (mipsel, build-std)
+              if: matrix.target == 'mipsel-unknown-linux-musl'
+              run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
+
+            - name: Build (mips, build-std)
+              if: matrix.target == 'mips-unknown-linux-musl'
+              run: cross +nightly build --release --bin tg-ws-proxy --target mips-unknown-linux-musl -Z build-std=std,panic_abort
+
+            - name: Inspect build output (mips variants)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
               run: |
-                mkdir -p .cargo
-                cat << 'EOF' > .cargo/config.toml
-                [target.mipsel-unknown-linux-musl]
-                linker = "zig-cc-linker"
-                rustflags = [
-                  "-C", "target-feature=+crt-static",
-                  "-C", "link-arg=-static",
-                  "-C", "link-arg=-mno-dsp",
-                  "-C", "link-arg=-march=mips32r2"
-                ]
-                EOF
+                  FILE="target/${{ matrix.target }}/release/tg-ws-proxy"
+                  ls -lah "target/${{ matrix.target }}/release/" || true
+                  test -f "$FILE"
 
-            - name: Create Custom Zig Linker Wrapper
-              run: |
-                echo '#!/bin/sh' > zig-cc-linker
-                echo 'zig cc -target mipsel-linux-musl "$@"' >> zig-cc-linker
-                chmod +x zig-cc-linker
-                echo "$(pwd)" >> $GITHUB_PATH
-
-            - name: Build Binary (Pure Zig + Rust Toolchain)
-              env:
-                  ring_core_no_asm: 1
-                  AWS_LC_SYS_NO_ASM: 1
-                  CC_mipsel_unknown_linux_musl: zig cc -target mipsel-linux-musl
-                  CC: zig cc -target mipsel-linux-musl
-                  AR: zig ar
-                  RUSTFLAGS: "-C opt-level=z -C panic=abort"
-              run: |
-                cargo build --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
-
-            - name: Prepare Assets
-              run: |
-                NAME="tg-ws-proxy-mipsel-static"
-                TMPDIR="$(mktemp -d)"
-                cp "target/mipsel-unknown-linux-musl/debug/tg-ws-proxy" "${TMPDIR}/tg-ws-proxy"
-                tar -C "${TMPDIR}" -czf "${NAME}.tar.gz" tg-ws-proxy
-                echo "ARCHIVE_NAME=${NAME}.tar.gz" >> $GITHUB_ENV
-
-            - name: Create GitHub Release and Upload Asset
+            - name: Upload to GitHub Release (mips variants)
+              if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              shell: bash
               run: |
-                TAG="${GITHUB_REF_NAME}"
-                gh release create "$TAG" --title "Release $TAG" --notes "Automated static build for MIPS (RT5350)" || true
-                gh release upload "$TAG" "${{ env.ARCHIVE_NAME }}" --clobber
+                  set -euxo pipefail
+                  TAG="${GITHUB_REF_NAME}"
+                  NAME="tg-ws-proxy-${{ matrix.target }}"
+                  TMPDIR="$(mktemp -d)"
+                  cp "target/${{ matrix.target }}/release/tg-ws-proxy" "${TMPDIR}/tg-ws-proxy"
+                  tar -C "${TMPDIR}" -czf "${NAME}.tar.gz" tg-ws-proxy
+                  gh release upload "$TAG" "${NAME}.tar.gz" --clobber
