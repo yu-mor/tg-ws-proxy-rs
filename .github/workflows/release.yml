@@ -15,36 +15,45 @@ jobs:
             - name: Checkout code
               uses: actions/checkout@v4
 
-            - name: Install Toolchain & Cross-Compiler
+            - name: Install Rust Toolchain
               run: |
-                sudo apt-get update
-                sudo apt-get install -y gcc-mipsel-linux-gnu musl-tools musl-dev
                 rustup default nightly
                 rustup component add rust-src --toolchain nightly
 
-            - name: Configure Cargo Linker
+            - name: Install Zig Compiler
+              uses: mitchellh/setup-zig@v1
+              with:
+                version: 0.13.0
+
+            - name: Configure Cargo Linker (Zig CC)
               run: |
                 mkdir -p .cargo
                 cat << 'EOF' > .cargo/config.toml
                 [target.mipsel-unknown-linux-musl]
-                linker = "mipsel-linux-gnu-gcc"
+                linker = "zig-cc-linker"
                 rustflags = [
                   "-C", "target-feature=+crt-static",
                   "-C", "link-arg=-static",
-                  "-C", "link-arg=-msoft-float",
                   "-C", "link-arg=-mno-dsp",
-                  "-C", "link-arg=-march=mips32r2",
-                  "-C", "strip=symbols"
+                  "-C", "link-arg=-march=mips32r2"
                 ]
                 EOF
 
-            - name: Build Binary (Pure Rust Toolchain)
+            - name: Create Custom Zig Linker Wrapper
+              run: |
+                echo '#!/bin/sh' > zig-cc-linker
+                echo 'zig cc -target mipsel-unknown-linux-musl "$@"' >> zig-cc-linker
+                chmod +x zig-cc-linker
+                echo "$(pwd)" >> $GITHUB_PATH
+
+            - name: Build Binary (Pure Zig + Rust Toolchain)
               env:
                   ring_core_no_asm: 1
                   AWS_LC_SYS_NO_ASM: 1
-                  CC_mipsel_unknown_linux_musl: mipsel-linux-gnu-gcc -msoft-float
-                  CC: mipsel-linux-gnu-gcc -msoft-float
-                  RUSTFLAGS: "-C opt-level=z -C panic=abort -C target-feature=+crt-static"
+                  CC_mipsel_unknown_linux_musl: zig cc -target mipsel-unknown-linux-musl
+                  CC: zig cc -target mipsel-unknown-linux-musl
+                  AR: zig ar
+                  RUSTFLAGS: "-C opt-level=z -C panic=abort"
               run: |
                 cargo build --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
 
