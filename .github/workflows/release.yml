@@ -42,7 +42,7 @@ jobs:
             - name: Create Custom Zig Linker Wrapper
               run: |
                 echo '#!/bin/sh' > zig-cc-linker
-                echo 'zig cc -target mipsel-unknown-linux-musl "$@"' >> zig-cc-linker
+                echo 'zig cc -target mipsel-linux-musl "$@"' >> zig-cc-linker
                 chmod +x zig-cc-linker
                 echo "$(pwd)" >> $GITHUB_PATH
 
@@ -50,8 +50,8 @@ jobs:
               env:
                   ring_core_no_asm: 1
                   AWS_LC_SYS_NO_ASM: 1
-                  CC_mipsel_unknown_linux_musl: zig cc -target mipsel-unknown-linux-musl
-                  CC: zig cc -target mipsel-unknown-linux-musl
+                  CC_mipsel_unknown_linux_musl: zig cc -target mipsel-linux-musl
+                  CC: zig cc -target mipsel-linux-musl
                   AR: zig ar
                   RUSTFLAGS: "-C opt-level=z -C panic=abort"
               run: |
