@@ -15,34 +15,32 @@ jobs:
             - name: Checkout code
               uses: actions/checkout@v4
 
-            - name: Install Toolchain & Cross-Compiler
+            - name: Install Toolchain & Tooling
               run: |
                 sudo apt-get update
-                sudo apt-get install -y gcc-mipsel-linux-gnu musl-tools
+                sudo apt-get install -y musl-tools
                 rustup default nightly
                 rustup component add rust-src --toolchain nightly
 
-            - name: Configure Cargo Linker
+            - name: Configure Cargo Linker (LLVM LLD)
               run: |
                 mkdir -p .cargo
                 cat << 'EOF' > .cargo/config.toml
                 [target.mipsel-unknown-linux-musl]
-                linker = "mipsel-linux-gnu-gcc"
+                linker = "rust-lld"
                 rustflags = [
                   "-C", "target-feature=+crt-static",
-                  "-C", "link-arg=-static",
+                  "-C", "link-self-contained=yes",
                   "-C", "link-arg=-mno-dsp",
                   "-C", "link-arg=-march=mips32r2",
                   "-C", "strip=symbols"
                 ]
                 EOF
 
-            - name: Build Binary (Pure Ubuntu Toolchain)
+            - name: Build Binary (Pure Rust Toolchain)
               env:
                   ring_core_no_asm: 1
                   AWS_LC_SYS_NO_ASM: 1
-                  CC_mipsel_unknown_linux_musl: mipsel-linux-gnu-gcc
-                  RUSTFLAGS: "-C opt-level=z -C panic=abort"
               run: |
                 cargo build --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
 
