@@ -9,56 +9,53 @@ on:
             - v[0-9]+.*
 
 jobs:
-    create-release:
+    build-and-release:
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v6
-            - uses: taiki-e/create-gh-release-action@v1
-              with:
-                  token: ${{ secrets.GITHUB_TOKEN }}
+            - name: Checkout code
+              uses: actions/checkout@v4
 
-    upload-assets:
-        needs: create-release
-        strategy:
-            fail-fast: false
-            matrix:
-                include:
-                    - target: mipsel-unknown-linux-musl
-                      os: ubuntu-latest
-        runs-on: ${{ matrix.os }}
-        steps:
-            - uses: actions/checkout@v6
+            - name: Install Toolchain & Cross-Compiler
+              run: |
+                sudo apt-get update
+                sudo apt-get install -y gcc-mipsel-linux-gnu musl-tools
+                rustup default nightly
+                rustup component add rust-src --toolchain nightly
 
-            - name: Install nightly + rust-src (mipsel)
-              uses: dtolnay/rust-toolchain@nightly
-              with:
-                  components: rust-src
+            - name: Configure Cargo Linker
+              run: |
+                mkdir -p .cargo
+                cat << 'EOF' > .cargo/config.toml
+                [target.mipsel-unknown-linux-musl]
+                linker = "mipsel-linux-gnu-gcc"
+                rustflags = [
+                  "-C", "target-feature=+crt-static",
+                  "-C", "link-arg=-static",
+                  "-C", "link-arg=-mno-dsp",
+                  "-C", "link-arg=-march=mips32r2"
+                ]
+                EOF
 
-            - name: Install cross (mipsel)
-              run: cargo install cross --locked
-
-            - name: Build (mipsel-musl static)
+            - name: Build Binary (Pure Ubuntu Toolchain)
               env:
                   ring_core_no_asm: 1
                   AWS_LC_SYS_NO_ASM: 1
-                  RUSTFLAGS: "-C target-feature=+crt-static"
-              run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
-
-            - name: Inspect build output (mipsel)
+                  CC_mipsel_unknown_linux_musl: mipsel-linux-gnu-gcc
               run: |
-                  FILE="target/${{ matrix.target }}/release/tg-ws-proxy"
-                  ls -lah "target/${{ matrix.target }}/release/" || true
-                  test -f "$FILE"
+                cargo build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
 
-            - name: Upload to GitHub Release (mipsel)
+            - name: Prepare Assets
+              run: |
+                NAME="tg-ws-proxy-mipsel-static"
+                TMPDIR="$(mktemp -d)"
+                cp "target/mipsel-unknown-linux-musl/release/tg-ws-proxy" "${TMPDIR}/tg-ws-proxy"
+                tar -C "${TMPDIR}" -czf "${NAME}.tar.gz" tg-ws-proxy
+                echo "ARCHIVE_NAME=${NAME}.tar.gz" >> $GITHUB_ENV
+
+            - name: Create GitHub Release and Upload Asset
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-              shell: bash
               run: |
-                  set -euxo pipefail
-                  TAG="${GITHUB_REF_NAME}"
-                  NAME="tg-ws-proxy-${{ matrix.target }}"
-                  TMPDIR="$(mktemp -d)"
-                  cp "target/${{ matrix.target }}/release/tg-ws-proxy" "${TMPDIR}/tg-ws-proxy"
-                  tar -C "${TMPDIR}" -czf "${NAME}.tar.gz" tg-ws-proxy
-                  gh release upload "$TAG" "${NAME}.tar.gz" --clobber
+                TAG="${GITHUB_REF_NAME}"
+                gh release create "$TAG" --title "Release $TAG" --notes "Automated static build for MIPS" || true
+                gh release upload "$TAG" "${{ env.ARCHIVE_NAME }}" --clobber
