@@ -1,5 +1,38 @@
 # tg-ws-proxy-rs
 
+**Installaton on openwrt 19.07.10**
+cd /tmp
+#you can put it to pouter via "upload package" without installation http://192.168.0.1/cgi-bin/luci/admin/system/opkg
+#mv upload.ipk tg-ws-proxy-mipsel-unknown-linux-musl.tar.gz
+wget https://github.com/yu-mor/tg-ws-proxy-rs/releases/download/v0.0.16/tg-ws-proxy-mipsel-unknown-linux-musl.tar.gz
+gunzip tg-ws-proxy-mipsel-unknown-linux-musl.tar.gz
+tar -xf tg-ws-proxy-mipsel-unknown-linux-musl.tar
+rm tg-ws-proxy-mipsel-unknown-linux-musl.tar
+mv tg-ws-proxy /overlay/upper/usr/bin/tg-ws-proxy-rs
+vi /etc/init.d/tg-ws-proxy-rs
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+
+    procd_set_param command /usr/bin/tg-ws-proxy-rs --host 0.0.0.0 --secret 11117a058cdfd46174da3fb6cd61111
+
+    procd_set_param respawn 3600 5 5  
+    procd_set_param stdout 1          
+    procd_set_param stderr 1          
+    procd_close_instance
+}
+esc
+ZZ
+chmod +x /etc/init.d/tg-ws-proxy-rs
+/etc/init.d/tg-ws-proxy-rs enable
+/etc/init.d/tg-ws-proxy-rs start
+logread
+
+
 **Telegram MTProto WebSocket Bridge Proxy** — a Rust **vibecoded** port of
 [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy).
 
