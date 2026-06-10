@@ -1,6 +1,7 @@
 # tg-ws-proxy-rs
 
 **Installaton on openwrt 19.07.10**
+```bash
 cd /tmp
 #you can put it to pouter via "upload package" without installation http://192.168.0.1/cgi-bin/luci/admin/system/opkg
 #mv upload.ipk tg-ws-proxy-mipsel-unknown-linux-musl.tar.gz
@@ -31,7 +32,7 @@ chmod +x /etc/init.d/tg-ws-proxy-rs
 /etc/init.d/tg-ws-proxy-rs enable
 /etc/init.d/tg-ws-proxy-rs start
 logread
-
+```
 
 **Telegram MTProto WebSocket Bridge Proxy** — a Rust **vibecoded** port of
 [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy).
