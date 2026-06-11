@@ -1,6 +1,6 @@
 # tg-ws-proxy-rs
 
-**Installaton on openwrt 19.07.10**
+**Installaton on openwrt 19.07.10 (viva el dir320)**
 ```bash
 cd /tmp
 #you can put it to router via "upload package" without installation http://192.168.0.1/cgi-bin/luci/admin/system/opkg
@@ -19,7 +19,7 @@ USE_PROCD=1
 start_service() {
     procd_open_instance
 
-    procd_set_param command /usr/bin/tg-ws-proxy-rs --host 0.0.0.0 --secret 11117a058cdfd46174da3fb6cd61111
+    procd_set_param command /usr/bin/tg-ws-proxy-rs --host 0.0.0.0 --secret 11117a058cdfd46174da3fb6cd61111 --default-domains
 
     procd_set_param respawn 3600 5 5  
     procd_set_param stdout 1          
