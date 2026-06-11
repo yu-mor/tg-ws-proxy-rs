@@ -11,6 +11,8 @@ tar -xf tg-ws-proxy-mipsel-unknown-linux-musl.tar
 rm tg-ws-proxy-mipsel-unknown-linux-musl.tar
 mv tg-ws-proxy /overlay/upper/usr/bin/tg-ws-proxy-rs
 vi /etc/init.d/tg-ws-proxy-rs
+```
+```bash
 #!/bin/sh /etc/rc.common
 
 START=99
@@ -26,8 +28,10 @@ start_service() {
     procd_set_param stderr 1          
     procd_close_instance
 }
-esc
+```
+press esc
 ZZ
+```bash
 chmod +x /etc/init.d/tg-ws-proxy-rs
 /etc/init.d/tg-ws-proxy-rs enable
 /etc/init.d/tg-ws-proxy-rs start
