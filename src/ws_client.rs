@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::default_dc_overrides;
+use crate::outbound::OutboundConnector;
 
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -66,6 +67,8 @@ pub fn ws_domains(dc: u32, is_media: bool) -> Vec<String> {
 
 /// Outcome of a WebSocket connection attempt.
 #[derive(Debug)]
+// Keep the successful stream unboxed to preserve the public API.
+#[allow(clippy::large_enum_variant)]
 pub enum WsConnectResult {
     /// Successful WebSocket upgrade.
     Connected(TgWsStream),
@@ -87,7 +90,35 @@ pub async fn connect_ws(
     skip_tls_verify: bool,
     timeout: Duration,
 ) -> WsConnectResult {
-    connect_ws_with_path(ip, domain, "/apiws", true, skip_tls_verify, timeout).await
+    connect_ws_with_outbound(
+        ip,
+        domain,
+        skip_tls_verify,
+        timeout,
+        &OutboundConnector::direct(),
+    )
+    .await
+}
+
+/// Same as [`connect_ws`], but routes the TCP connection through the supplied
+/// outbound connector.
+pub async fn connect_ws_with_outbound(
+    ip: &str,
+    domain: &str,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> WsConnectResult {
+    connect_ws_with_path(
+        ip,
+        domain,
+        "/apiws",
+        true,
+        skip_tls_verify,
+        timeout,
+        outbound,
+    )
+    .await
 }
 
 async fn connect_ws_with_path(
@@ -97,12 +128,14 @@ async fn connect_ws_with_path(
     request_binary_subprotocol: bool,
     skip_tls_verify: bool,
     timeout: Duration,
+    outbound: &OutboundConnector,
 ) -> WsConnectResult {
     // ── TCP connection to the configured IP ──────────────────────────────
-    let tcp = match tokio::time::timeout(timeout, TcpStream::connect(format!("{}:443", ip))).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return WsConnectResult::Failed(format!("TCP connect: {}", e)),
-        Err(_) => return WsConnectResult::Failed("TCP connect timed out".into()),
+    let tcp = match outbound.connect(ip, 443, timeout).await {
+        Ok(s) => s,
+        Err(e) => {
+            return WsConnectResult::Failed(e);
+        }
     };
 
     // Disable Nagle algorithm for lower latency.
@@ -218,6 +251,27 @@ pub async fn connect_ws_for_dc(
     skip_tls_verify: bool,
     timeout: Duration,
 ) -> (Option<TgWsStream>, bool) {
+    connect_ws_for_dc_with_outbound(
+        ip,
+        dc,
+        is_media,
+        skip_tls_verify,
+        timeout,
+        &OutboundConnector::direct(),
+    )
+    .await
+}
+
+/// Same as [`connect_ws_for_dc`], but routes each TCP connection through the
+/// supplied outbound connector.
+pub async fn connect_ws_for_dc_with_outbound(
+    ip: &str,
+    dc: u32,
+    is_media: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> (Option<TgWsStream>, bool) {
     let domains = ws_domains(dc, is_media);
     let mut all_redirects = true;
 
@@ -230,7 +284,7 @@ pub async fn connect_ws_for_dc(
             ip
         );
 
-        match connect_ws(ip, domain, skip_tls_verify, timeout).await {
+        match connect_ws_with_outbound(ip, domain, skip_tls_verify, timeout, outbound).await {
             WsConnectResult::Connected(ws) => {
                 return (Some(ws), false);
             }
@@ -310,6 +364,27 @@ pub async fn connect_cf_ws_for_dc(
     skip_tls_verify: bool,
     timeout: Duration,
 ) -> (Option<TgWsStream>, bool) {
+    connect_cf_ws_for_dc_with_outbound(
+        dc,
+        cf_domains,
+        is_media,
+        skip_tls_verify,
+        timeout,
+        &OutboundConnector::direct(),
+    )
+    .await
+}
+
+/// Same as [`connect_cf_ws_for_dc`], but routes each TCP connection through the
+/// supplied outbound connector.
+pub async fn connect_cf_ws_for_dc_with_outbound(
+    dc: u32,
+    cf_domains: &[String],
+    is_media: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> (Option<TgWsStream>, bool) {
     let domains = cf_ws_domains(dc, cf_domains, is_media);
     let mut all_redirects = true;
     // Track domains we have already attempted so that a transparent `-1` →
@@ -332,7 +407,7 @@ pub async fn connect_cf_ws_for_dc(
 
         // Pass the CF domain as the TCP host so that Tokio's DNS resolution
         // returns Cloudflare's anycast IP rather than Telegram's DC IP.
-        match connect_ws(domain, domain, skip_tls_verify, timeout).await {
+        match connect_ws_with_outbound(domain, domain, skip_tls_verify, timeout, outbound).await {
             WsConnectResult::Connected(ws) => {
                 return (Some(ws), false);
             }
@@ -359,7 +434,15 @@ pub async fn connect_cf_ws_for_dc(
                         fallback
                     );
                     tried.insert(fallback.clone());
-                    match connect_ws(&fallback, &fallback, skip_tls_verify, timeout).await {
+                    match connect_ws_with_outbound(
+                        &fallback,
+                        &fallback,
+                        skip_tls_verify,
+                        timeout,
+                        outbound,
+                    )
+                    .await
+                    {
                         WsConnectResult::Connected(ws) => {
                             return (Some(ws), false);
                         }
@@ -414,6 +497,29 @@ pub async fn connect_cf_worker_ws_for_dc(
     skip_tls_verify: bool,
     timeout: Duration,
 ) -> Option<TgWsStream> {
+    connect_cf_worker_ws_for_dc_with_outbound(
+        worker_domain,
+        dst,
+        dc,
+        is_media,
+        skip_tls_verify,
+        timeout,
+        &OutboundConnector::direct(),
+    )
+    .await
+}
+
+/// Same as [`connect_cf_worker_ws_for_dc`], but routes the TCP connection
+/// through the supplied outbound connector.
+pub async fn connect_cf_worker_ws_for_dc_with_outbound(
+    worker_domain: &str,
+    dst: &str,
+    dc: u32,
+    is_media: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+) -> Option<TgWsStream> {
     let path = cf_worker_path(dst, dc, is_media);
     debug!(
         "CF Worker trying DC{}{} → {} via {}",
@@ -430,6 +536,7 @@ pub async fn connect_cf_worker_ws_for_dc(
         false,
         skip_tls_verify,
         timeout,
+        outbound,
     )
     .await
     {

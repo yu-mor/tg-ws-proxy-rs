@@ -9,6 +9,8 @@ use std::net::UdpSocket;
 
 use clap::Parser;
 
+use crate::outbound::OutboundConnector;
+
 // ─── Telegram DC default IPs ─────────────────────────────────────────────────
 // These are the "fallback" addresses used when a DC is not listed in
 // `--dc-ip` or when WebSocket routing fails and we must fall back to TCP.
@@ -357,6 +359,29 @@ pub struct Config {
     ///   https://github.com/Flowseal/tg-ws-proxy/blob/main/.github/cfproxy-domains.txt
     #[arg(long = "default-domains", env = "TG_DEFAULT_DOMAINS")]
     pub default_domains: bool,
+
+    /// Outbound proxy used for all outgoing connections.
+    ///
+    /// Supports `http://user:pass@host:port` CONNECT proxies and
+    /// `socks5://` / `socks5h://` proxies.  Standard proxy environment
+    /// variables are also honored when this option is omitted:
+    /// `HTTPS_PROXY`, `ALL_PROXY`, then `HTTP_PROXY` (including lowercase
+    /// variants).
+    #[arg(long = "outbound-proxy", value_name = "URL", env = "TG_OUTBOUND_PROXY")]
+    pub outbound_proxy: Option<String>,
+
+    /// Disable automatic outbound proxy discovery from standard environment
+    /// variables. Also useful with `TG_OUTBOUND_PROXY=direct`.
+    #[arg(long = "no-outbound-proxy", env = "TG_NO_OUTBOUND_PROXY")]
+    pub no_outbound_proxy: bool,
+
+    /// Comma-separated hosts that should bypass the outbound proxy.
+    ///
+    /// Supports standard NO_PROXY host/domain entries, optional ports, CIDR,
+    /// bracketed IPv6 and `*`.  Bare domain entries may also match subdomains.
+    /// Standard `NO_PROXY` / `no_proxy` variables are honored when omitted.
+    #[arg(long = "no-proxy", value_name = "LIST", env = "TG_NO_PROXY")]
+    pub no_proxy: Option<String>,
 }
 
 impl Config {
@@ -482,6 +507,15 @@ impl Config {
         }
     }
 
+    /// Build the outbound connector from CLI/env settings.
+    pub fn outbound_connector(&self) -> Result<OutboundConnector, String> {
+        OutboundConnector::from_config(
+            self.outbound_proxy.as_deref(),
+            self.no_proxy.as_deref(),
+            !self.no_outbound_proxy,
+        )
+    }
+
     /// The hostname/IP to advertise in the generated `tg://proxy` link.
     ///
     /// Resolution order:
@@ -497,10 +531,8 @@ impl Config {
         // Auto-detect when the bind address is not directly reachable by
         // remote clients (wildcard or loopback).
         let bind_is_local = matches!(self.host.as_str(), "0.0.0.0" | "::" | "127.0.0.1" | "::1");
-        if bind_is_local {
-            if let Some(lan_ip) = detect_lan_ip() {
-                return lan_ip;
-            }
+        if bind_is_local && let Some(lan_ip) = detect_lan_ip() {
+            return lan_ip;
         }
 
         self.host.clone()
@@ -533,10 +565,12 @@ fn detect_lan_ip() -> Option<String> {
     let ip = local_addr.ip();
 
     // Only return a usable unicast IPv4 address.
-    if let std::net::IpAddr::V4(v4) = ip {
-        if !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified() {
-            return Some(v4.to_string());
-        }
+    if let std::net::IpAddr::V4(v4) = ip
+        && !v4.is_loopback()
+        && !v4.is_link_local()
+        && !v4.is_unspecified()
+    {
+        return Some(v4.to_string());
     }
 
     None

@@ -33,14 +33,14 @@ fn soft_nofile_limit() -> usize {
             for line in content.lines() {
                 // Example line:
                 //   Max open files            1024                 4096                 files
-                if line.starts_with("Max open files") {
-                    if let Some(soft_str) = line.split_whitespace().nth(3) {
-                        if soft_str == "unlimited" {
-                            return usize::MAX;
-                        }
-                        if let Ok(n) = soft_str.parse::<usize>() {
-                            return n;
-                        }
+                if line.starts_with("Max open files")
+                    && let Some(soft_str) = line.split_whitespace().nth(3)
+                {
+                    if soft_str == "unlimited" {
+                        return usize::MAX;
+                    }
+                    if let Ok(n) = soft_str.parse::<usize>() {
+                        return n;
                     }
                 }
             }
@@ -71,7 +71,9 @@ fn auto_max_connections(fd_limit: usize, pool_size: usize, dc_buckets: usize) ->
     (fd_limit.saturating_sub(reserved) / 2).max(4)
 }
 
-use tg_ws_proxy_rs::{check, config::Config, default_domains, pool::WsPool, proxy};
+use tg_ws_proxy_rs::{
+    check, config::Config, default_domains, pool::WsPool, proxy, runtime::Runtime,
+};
 
 #[tokio::main]
 async fn main() {
@@ -80,6 +82,14 @@ async fn main() {
         .expect("failed to install rustls ring CryptoProvider");
 
     let mut config = Config::from_args();
+    let outbound = match config.outbound_connector() {
+        Ok(outbound) => outbound,
+        Err(e) => {
+            eprintln!("invalid outbound proxy config: {e}");
+            std::process::exit(2);
+        }
+    };
+    let runtime = Arc::new(Runtime::new(outbound));
 
     // ── Logging ──────────────────────────────────────────────────────────
     let log_level = if config.quiet {
@@ -124,7 +134,8 @@ async fn main() {
     // the same fetched list.
     if config.default_domains {
         info!("Fetching default CF proxy domain list from GitHub…");
-        let fetched = default_domains::fetch_default_domains().await;
+        let fetched =
+            default_domains::fetch_default_domains_with_outbound(runtime.outbound()).await;
         info!("  Got {} default CF domain(s)", fetched.len());
         config.cf_domains.extend(fetched);
     }
@@ -134,7 +145,7 @@ async fn main() {
     // results, then exit.  This lets the user verify their configuration
     // before starting the proxy server.
     if config.check {
-        let all_ok = check::run_check(&config).await;
+        let all_ok = check::run_check_with_outbound(&config, runtime.outbound()).await;
         std::process::exit(if all_ok { 0 } else { 1 });
     }
 
@@ -227,6 +238,10 @@ async fn main() {
         }
     }
 
+    if let Some(summary) = runtime.outbound().summary() {
+        info!("  Outbound proxy: {}", summary);
+    }
+
     info!(
         "  Max connections: {} (fd-limit: {})",
         max_connections, fd_limit
@@ -262,9 +277,10 @@ async fn main() {
     info!("{}", "=".repeat(60));
 
     // ── Connection pool warm-up ───────────────────────────────────────────
-    let pool = Arc::new(WsPool::new(
+    let pool = Arc::new(WsPool::with_runtime(
         config.pool_size,
         Duration::from_secs(config.pool_max_age),
+        Arc::clone(&runtime),
     ));
     {
         let pool_clone = pool.clone();
@@ -294,11 +310,12 @@ async fn main() {
             Ok((stream, peer_addr)) => {
                 let cfg = config.clone();
                 let pool = pool.clone();
+                let runtime = Arc::clone(&runtime);
                 tokio::spawn(async move {
                     // Hold the permit for the lifetime of this connection so
                     // it is released (and the slot freed) when the task ends.
                     let _permit = permit;
-                    proxy::handle_client(stream, peer_addr, cfg, pool).await;
+                    proxy::handle_client_with_runtime(stream, peer_addr, cfg, pool, runtime).await;
                 });
             }
             Err(e) => {
