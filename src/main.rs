@@ -184,7 +184,7 @@ async fn main() {
     };
 
     // ── Print startup banner ──────────────────────────────────────────────
-    let secret = config.secret.as_deref().unwrap_or("");
+    let secret = config.primary_secret();
 
     let link_host = config.link_host();
     let tg_link = format!(
@@ -249,6 +249,16 @@ async fn main() {
     info!("{}", "=".repeat(60));
     info!("  Telegram proxy link (use this on all devices):");
     info!("    {}", tg_link);
+    if config.secrets.len() > 1 {
+        info!("  Additional per-user proxy links:");
+        for secret in &config.secrets[1..] {
+            let link_secret = config.link_secret_for(secret);
+            info!(
+                "    tg://proxy?server={}&port={}&secret={}",
+                link_host, config.port, link_secret
+            );
+        }
+    }
 
     if link_host != config.host {
         info!(

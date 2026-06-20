@@ -95,7 +95,7 @@ tg-ws-proxy [OPTIONS]
 | `--port <PORT>` | `1443` | Listen port |
 | `--host <HOST>` | `127.0.0.1` | Listen address |
 | `--link-ip <IP>` | auto-detected | IP shown in the `tg://` link (see [Router deployment](#router-deployment)) |
-| `--secret <HEX>` | random | 32 hex-char MTProto secret |
+| `--secret <HEX>` | random | 32 hex-char MTProto secret (repeatable / comma-separated for per-user secrets) |
 | `--listen-faketls-domain <DOMAIN>` | — | Accept inbound clients with `ee` FakeTLS and advertise this SNI domain in the link |
 | `--dc-ip <DC:IP>` | DC2 + DC4 | Target IP per DC (repeatable); omit when using `--cf-domain` to let CF proxy handle all DCs |
 | `--buf-kb <KB>` | `256` | Socket buffer size |
@@ -201,6 +201,17 @@ On startup the proxy prints a `tg://proxy?...` link you can paste into
 Telegram Desktop to configure it automatically. With `--listen-faketls-domain`,
 the printed link uses `secret=ee<key><domain_hex>`; otherwise it uses the
 classic `dd<key>` padded MTProto secret.
+
+To issue separate credentials per user, pass multiple `--secret` values:
+
+```bash
+tg-ws-proxy --host 0.0.0.0 --port 443 \
+  --secret 11111111111111111111111111111111 \
+  --secret 22222222222222222222222222222222
+```
+
+The proxy will accept all configured secrets and print an individual `tg://`
+link for each additional secret.
 
 ### Inbound FakeTLS listener
 

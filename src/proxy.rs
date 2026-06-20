@@ -268,7 +268,7 @@ async fn accept_inbound_faketls(
     label: &str,
     reader: &mut TcpReader,
     writer: &mut TcpWriter,
-    secret: &[u8],
+    secrets: &[Vec<u8>],
     expected_domain: &str,
 ) -> Option<([u8; 64], Vec<u8>)> {
     let (record_type, version, payload) = read_tls_record(reader, TLS_MAX_RECORD_PAYLOAD + 256)
@@ -285,8 +285,11 @@ async fn accept_inbound_faketls(
     record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     record.extend_from_slice(&payload);
 
-    let hello = match parse_faketls_client_hello(&record, secret) {
-        Some(hello) => hello,
+    let (hello, matched_secret) = match secrets
+        .iter()
+        .find_map(|secret| parse_faketls_client_hello(&record, secret).map(|hello| (hello, secret)))
+    {
+        Some(v) => v,
         None => {
             debug!("[{}] bad FakeTLS ClientHello digest", label);
             return None;
@@ -301,7 +304,7 @@ async fn accept_inbound_faketls(
         return None;
     }
 
-    let server_hello = build_faketls_server_hello(secret, &hello);
+    let server_hello = build_faketls_server_hello(matched_secret, &hello);
     if let Err(e) = writer.write_all(&server_hello).await {
         debug!("[{}] write FakeTLS ServerHello: {}", label, e);
         return None;
@@ -361,7 +364,7 @@ pub async fn handle_client_with_runtime(
     let label = peer.to_string();
     let _ = stream.set_nodelay(true);
 
-    let secret = config.secret_bytes();
+    let secrets = config.secret_bytes_list();
     let dc_redirects = config.dc_redirects();
     let skip_tls = config.skip_tls_verify;
 
@@ -388,7 +391,7 @@ pub async fn handle_client_with_runtime(
             &label,
             &mut reader,
             &mut writer,
-            &secret,
+            &secrets,
             inbound_faketls_domain.as_deref(),
         ),
     )
@@ -417,8 +420,11 @@ pub async fn handle_client_with_runtime(
     };
 
     // ── Step 2: parse and validate the handshake ─────────────────────────
-    let info = match parse_handshake(&handshake_buf, &secret) {
-        Some(i) => i,
+    let (info, secret) = match secrets
+        .iter()
+        .find_map(|secret| parse_handshake(&handshake_buf, secret).map(|i| (i, secret.as_slice())))
+    {
+        Some(v) => v,
         None => {
             debug!(
                 "[{}] bad handshake (wrong secret or reserved prefix)",
@@ -456,7 +462,7 @@ pub async fn handle_client_with_runtime(
     let relay_init = generate_relay_init(proto, dc_idx);
 
     // ── Step 4: build all four AES-256-CTR ciphers ───────────────────────
-    let ciphers = build_connection_ciphers(&info.prekey_and_iv, &secret, &relay_init);
+    let ciphers = build_connection_ciphers(&info.prekey_and_iv, secret, &relay_init);
 
     // ── Step 5: route the connection ──────────────────────────────────────
     let target_ip = dc_redirects.get(&dc_id).cloned();
@@ -1773,11 +1779,11 @@ async fn read_inbound_handshake(
     label: &str,
     reader: &mut TcpReader,
     writer: &mut TcpWriter,
-    secret: &[u8],
+    secrets: &[Vec<u8>],
     faketls_domain: Option<&str>,
 ) -> Option<([u8; 64], Vec<u8>)> {
     if let Some(domain) = faketls_domain {
-        return accept_inbound_faketls(label, reader, writer, secret, domain).await;
+        return accept_inbound_faketls(label, reader, writer, secrets, domain).await;
     }
 
     let mut handshake_buf = [0u8; 64];
