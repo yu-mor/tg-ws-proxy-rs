@@ -217,9 +217,10 @@ pub struct Config {
         long = "cf-worker-domain",
         alias = "cfproxy-worker-domain",
         value_name = "DOMAIN",
+        value_delimiter = ',',
         env = "TG_CF_WORKER_DOMAIN"
     )]
-    pub cf_worker_domain: Option<String>,
+    pub cf_worker_domains: Vec<String>,
 
     /// Prioritise Cloudflare proxy over direct WebSocket connections for all
     /// DCs (even those with `--dc-ip` configured).
@@ -483,9 +484,23 @@ impl Config {
         self.dc_ip.iter().cloned().collect()
     }
 
-    /// Cloudflare Worker domain normalized for `Host` and TLS SNI use.
+    /// Cloudflare Worker domains normalized for `Host` and TLS SNI use.
+    pub fn cf_worker_domains(&self) -> Vec<String> {
+        self.cf_worker_domains
+            .iter()
+            .filter_map(|domain| Self::normalize_cf_worker_domain(domain))
+            .collect()
+    }
+
+    /// First normalized Cloudflare Worker domain.
+    /// Kept for compatibility with single-domain call sites.
     pub fn cf_worker_domain(&self) -> Option<String> {
-        let domain = self.cf_worker_domain.as_deref()?.trim();
+        self.cf_worker_domains().into_iter().next()
+    }
+
+    /// Cloudflare Worker domain normalized for `Host` and TLS SNI use.
+    fn normalize_cf_worker_domain(domain: &str) -> Option<String> {
+        let domain = domain.trim();
         if domain.is_empty() {
             return None;
         }

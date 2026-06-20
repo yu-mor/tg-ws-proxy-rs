@@ -101,10 +101,10 @@ tg-ws-proxy [OPTIONS]
 | `--buf-kb <KB>` | `256` | Socket buffer size |
 | `--pool-size <N>` | `4` | Pre-warmed WS connections per DC |
 | `--cf-domain <DOMAIN>` | — | Cloudflare-proxied domain(s) for alternative WS routing, comma-separated (see [CF Proxy](#cloudflare-proxy)) |
-| `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain for TCP-tunnel fallback, no owned domain required (see [Cloudflare Worker](#cloudflare-worker)) |
+| `--cf-worker-domain <DOMAIN>` | — | Cloudflare Worker domain(s) for TCP-tunnel fallback, comma-separated/repeatable (see [Cloudflare Worker](#cloudflare-worker)) |
 | `--default-domains` | off | Fetch and use the built-in CF proxy domain list from GitHub (no Cloudflare setup needed, see [Default domains](#default-domains)) |
 | `--cf-priority` | off | Try CF proxy **before** direct WS for all DCs (see [CF Proxy](#cloudflare-proxy)) |
-| `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` values (see [CF Proxy](#cloudflare-proxy)) |
+| `--cf-balance` | off | Round-robin load balance across multiple `--cf-domain` and `--cf-worker-domain` values (see [CF Proxy](#cloudflare-proxy)) |
 | `--max-connections <N>` | auto | Max concurrent client connections (auto-computed from `ulimit -n`) |
 | `--mtproto-proxy <HOST:PORT:SECRET>` | — | Upstream MTProto proxy fallback (repeatable) |
 | `--outbound-proxy <URL>` | — | Proxy for all outgoing connections: `http://`, `socks5://`, or `socks5h://`; `https://` proxy URLs are not supported |
@@ -399,6 +399,14 @@ copy its `*.workers.dev` domain, and pass it to the proxy:
 
 ```bash
 tg-ws-proxy --cf-worker-domain random-symbols-1234.username.workers.dev
+```
+
+Multiple Worker domains are supported (comma-separated or repeated flag).
+With `--cf-balance`, each new connection starts from a different Worker and
+falls back to the remaining Workers if the first one fails.
+
+```bash
+tg-ws-proxy --cf-worker-domain w1.user.workers.dev,w2.user.workers.dev --cf-balance
 ```
 
 Or via environment variable:
