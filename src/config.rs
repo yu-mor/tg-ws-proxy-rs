@@ -9,6 +9,8 @@ use std::net::UdpSocket;
 
 use clap::Parser;
 
+use crate::outbound::OutboundConnector;
+
 // ─── Telegram DC default IPs ─────────────────────────────────────────────────
 // These are the "fallback" addresses used when a DC is not listed in
 // `--dc-ip` or when WebSocket routing fails and we must fall back to TCP.
@@ -106,10 +108,11 @@ pub struct Config {
     #[arg(long, default_value = "127.0.0.1", env = "TG_HOST")]
     pub host: String,
 
-    /// MTProto proxy secret (32 hex chars).
+    /// MTProto proxy secret(s) (32 hex chars each).
+    /// Can be specified multiple times or as a comma-separated list.
     /// A random secret is generated if not provided.
-    #[arg(long, env = "TG_SECRET")]
-    pub secret: Option<String>,
+    #[arg(long = "secret", value_delimiter = ',', env = "TG_SECRET")]
+    pub secrets: Vec<String>,
 
     /// Accept inbound Telegram clients using `ee` FakeTLS camouflage with this
     /// SNI hostname. The generated proxy link will use `secret=ee<key><hosthex>`.
@@ -357,6 +360,29 @@ pub struct Config {
     ///   https://github.com/Flowseal/tg-ws-proxy/blob/main/.github/cfproxy-domains.txt
     #[arg(long = "default-domains", env = "TG_DEFAULT_DOMAINS")]
     pub default_domains: bool,
+
+    /// Outbound proxy used for all outgoing connections.
+    ///
+    /// Supports `http://user:pass@host:port` CONNECT proxies and
+    /// `socks5://` / `socks5h://` proxies.  Standard proxy environment
+    /// variables are also honored when this option is omitted:
+    /// `HTTPS_PROXY`, `ALL_PROXY`, then `HTTP_PROXY` (including lowercase
+    /// variants).
+    #[arg(long = "outbound-proxy", value_name = "URL", env = "TG_OUTBOUND_PROXY")]
+    pub outbound_proxy: Option<String>,
+
+    /// Disable automatic outbound proxy discovery from standard environment
+    /// variables. Also useful with `TG_OUTBOUND_PROXY=direct`.
+    #[arg(long = "no-outbound-proxy", env = "TG_NO_OUTBOUND_PROXY")]
+    pub no_outbound_proxy: bool,
+
+    /// Comma-separated hosts that should bypass the outbound proxy.
+    ///
+    /// Supports standard NO_PROXY host/domain entries, optional ports, CIDR,
+    /// bracketed IPv6 and `*`.  Bare domain entries may also match subdomains.
+    /// Standard `NO_PROXY` / `no_proxy` variables are honored when omitted.
+    #[arg(long = "no-proxy", value_name = "LIST", env = "TG_NO_PROXY")]
+    pub no_proxy: Option<String>,
 }
 
 impl Config {
@@ -365,9 +391,9 @@ impl Config {
         let mut cfg = Self::parse();
 
         // Fill in a random secret if none was supplied.
-        if cfg.secret.is_none() {
+        if cfg.secrets.is_empty() {
             let bytes: [u8; 16] = rand::random();
-            cfg.secret = Some(hex::encode(bytes));
+            cfg.secrets.push(hex::encode(bytes));
         }
 
         // If no --dc-ip was given, use the built-in defaults — unless a CF
@@ -384,15 +410,34 @@ impl Config {
         cfg
     }
 
-    /// The proxy secret as raw bytes (decoded from hex).
-    pub fn secret_bytes(&self) -> Vec<u8> {
-        let raw =
-            hex::decode(self.secret.as_deref().unwrap_or("")).expect("secret must be valid hex");
+    /// Primary proxy secret (the first configured value).
+    pub fn primary_secret(&self) -> &str {
+        self.secrets.first().map(String::as_str).unwrap_or("")
+    }
+
+    fn normalize_secret_bytes(raw: Vec<u8>) -> Vec<u8> {
         if raw.len() >= 17 && matches!(raw[0], 0xdd | 0xee) {
             raw[1..17].to_vec()
         } else {
             raw
         }
+    }
+
+    /// The proxy secret as raw bytes (decoded from hex).
+    pub fn secret_bytes(&self) -> Vec<u8> {
+        let raw = hex::decode(self.primary_secret()).expect("secret must be valid hex");
+        Self::normalize_secret_bytes(raw)
+    }
+
+    /// All configured proxy secrets as raw bytes.
+    pub fn secret_bytes_list(&self) -> Vec<Vec<u8>> {
+        self.secrets
+            .iter()
+            .map(|s| {
+                let raw = hex::decode(s).expect("secret must be valid hex");
+                Self::normalize_secret_bytes(raw)
+            })
+            .collect()
     }
 
     /// Inbound FakeTLS domain, either from `--listen-faketls-domain` or from
@@ -402,7 +447,7 @@ impl Config {
             return Some(domain.clone());
         }
 
-        let raw = hex::decode(self.secret.as_deref().unwrap_or("")).ok()?;
+        let raw = hex::decode(self.primary_secret()).ok()?;
         if raw.len() > 17 && raw[0] == 0xee {
             return std::str::from_utf8(&raw[17..]).ok().map(ToOwned::to_owned);
         }
@@ -412,7 +457,11 @@ impl Config {
 
     /// Full secret value for the generated Telegram link.
     pub fn link_secret(&self) -> String {
-        let secret = self.secret.as_deref().unwrap_or("");
+        self.link_secret_for(self.primary_secret())
+    }
+
+    /// Full secret value for the generated Telegram link for any configured secret.
+    pub fn link_secret_for(&self, secret: &str) -> String {
         if let Some(domain) = self.listen_faketls_domain() {
             let raw = hex::decode(secret).expect("secret must be valid hex");
             let key = if raw.len() >= 17 && matches!(raw[0], 0xdd | 0xee) {
@@ -473,6 +522,15 @@ impl Config {
         }
     }
 
+    /// Build the outbound connector from CLI/env settings.
+    pub fn outbound_connector(&self) -> Result<OutboundConnector, String> {
+        OutboundConnector::from_config(
+            self.outbound_proxy.as_deref(),
+            self.no_proxy.as_deref(),
+            !self.no_outbound_proxy,
+        )
+    }
+
     /// The hostname/IP to advertise in the generated `tg://proxy` link.
     ///
     /// Resolution order:
@@ -488,10 +546,8 @@ impl Config {
         // Auto-detect when the bind address is not directly reachable by
         // remote clients (wildcard or loopback).
         let bind_is_local = matches!(self.host.as_str(), "0.0.0.0" | "::" | "127.0.0.1" | "::1");
-        if bind_is_local {
-            if let Some(lan_ip) = detect_lan_ip() {
-                return lan_ip;
-            }
+        if bind_is_local && let Some(lan_ip) = detect_lan_ip() {
+            return lan_ip;
         }
 
         self.host.clone()
@@ -524,10 +580,12 @@ fn detect_lan_ip() -> Option<String> {
     let ip = local_addr.ip();
 
     // Only return a usable unicast IPv4 address.
-    if let std::net::IpAddr::V4(v4) = ip {
-        if !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified() {
-            return Some(v4.to_string());
-        }
+    if let std::net::IpAddr::V4(v4) = ip
+        && !v4.is_loopback()
+        && !v4.is_link_local()
+        && !v4.is_unspecified()
+    {
+        return Some(v4.to_string());
     }
 
     None

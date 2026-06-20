@@ -42,6 +42,28 @@ fn plain_secret_still_generates_dd_link() {
 }
 
 #[test]
+fn multiple_secrets_are_parsed_and_primary_link_uses_first_secret() {
+    let first = "11111111111111111111111111111111";
+    let second = "22222222222222222222222222222222";
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--secret",
+        first,
+        "--secret",
+        second,
+    ])
+    .unwrap();
+
+    assert_eq!(cfg.secrets, vec![first.to_string(), second.to_string()]);
+    assert_eq!(cfg.secret_bytes(), hex::decode(first).unwrap());
+    assert_eq!(
+        cfg.secret_bytes_list(),
+        vec![hex::decode(first).unwrap(), hex::decode(second).unwrap()]
+    );
+    assert_eq!(cfg.link_secret(), format!("dd{}", first));
+}
+
+#[test]
 fn cf_worker_domain_accepts_python_alias_and_normalizes_url() {
     // The Python reference uses --cfproxy-worker-domain; keep that spelling
     // working while advertising the shorter Rust-style --cf-worker-domain.

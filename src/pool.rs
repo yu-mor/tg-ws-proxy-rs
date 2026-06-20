@@ -18,7 +18,9 @@ use tracing::{debug, warn};
 use futures_util::{FutureExt, StreamExt};
 
 use crate::config::Config;
-use crate::ws_client::{TgWsStream, connect_ws_for_dc};
+use crate::outbound::OutboundConnector;
+use crate::runtime::Runtime;
+use crate::ws_client::{TgWsStream, connect_ws_for_dc_with_outbound};
 
 struct PoolEntry {
     ws: TgWsStream,
@@ -33,6 +35,7 @@ pub struct WsPool {
     /// Maximum age for a pooled connection.  Connections older than this are
     /// discarded on next use rather than handed to a client.
     max_age: Duration,
+    runtime: Arc<Runtime>,
     idle: Mutex<PoolMap>,
     /// Tracks which (dc, is_media) buckets currently have a refill in flight.
     /// Prevents a stampede of concurrent refill tasks when many clients arrive
@@ -60,9 +63,18 @@ impl Drop for RefillGuard<'_> {
 
 impl WsPool {
     pub fn new(pool_size: usize, max_age: Duration) -> Self {
+        Self::with_runtime(
+            pool_size,
+            max_age,
+            Arc::new(Runtime::new(OutboundConnector::direct())),
+        )
+    }
+
+    pub fn with_runtime(pool_size: usize, max_age: Duration, runtime: Arc<Runtime>) -> Self {
         Self {
             pool_size,
             max_age,
+            runtime,
             idle: Mutex::new(HashMap::new()),
             refilling: StdMutex::new(HashSet::new()),
         }
@@ -142,7 +154,9 @@ impl WsPool {
 
         for (dc, ip) in dc_redirects {
             for is_media in [false, true] {
-                let new_conns = Self::connect_batch(&ip, dc, is_media, skip_tls, pool_size).await;
+                let new_conns = self
+                    .connect_batch(&ip, dc, is_media, skip_tls, pool_size)
+                    .await;
                 let mut lock = self.idle.lock().await;
                 let bucket = lock.entry((dc, is_media)).or_default();
 
@@ -188,7 +202,9 @@ impl WsPool {
             self.pool_size - current
         };
 
-        let new_conns = Self::connect_batch(&target_ip, dc, is_media, skip_tls, needed).await;
+        let new_conns = self
+            .connect_batch(&target_ip, dc, is_media, skip_tls, needed)
+            .await;
         if !new_conns.is_empty() {
             let mut lock = self.idle.lock().await;
             let bucket = lock.entry((dc, is_media)).or_default();
@@ -214,6 +230,7 @@ impl WsPool {
     }
 
     async fn connect_batch(
+        &self,
         ip: &str,
         dc: u32,
         is_media: bool,
@@ -225,7 +242,16 @@ impl WsPool {
         let timeout = Duration::from_secs(8);
 
         for _ in 0..count {
-            match connect_ws_for_dc(ip, dc, is_media, skip_tls, timeout).await {
+            match connect_ws_for_dc_with_outbound(
+                ip,
+                dc,
+                is_media,
+                skip_tls,
+                timeout,
+                self.runtime.outbound(),
+            )
+            .await
+            {
                 (Some(ws), _) => results.push(ws),
                 (None, _) => {
                     warn!(
