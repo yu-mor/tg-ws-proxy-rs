@@ -5,7 +5,7 @@
 cd /tmp
 #you can put it to router via "upload package" without installation http://192.168.0.1/cgi-bin/luci/admin/system/opkg
 #mv upload.ipk tg-ws-proxy-mipsel-unknown-linux-musl.tar.gz
-wget https://github.com/yu-mor/tg-ws-proxy-rs/releases/download/v0.0.16/tg-ws-proxy-mipsel-unknown-linux-musl.tar.gz
+wget https://github.com/yu-mor/tg-ws-proxy-rs/releases/latest/download/tg-ws-proxy-mipsel-unknown-linux-musl.tar.gz
 gunzip tg-ws-proxy-mipsel-unknown-linux-musl.tar.gz
 tar -xf tg-ws-proxy-mipsel-unknown-linux-musl.tar
 rm tg-ws-proxy-mipsel-unknown-linux-musl.tar
