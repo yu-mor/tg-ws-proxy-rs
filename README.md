@@ -3,7 +3,7 @@
 **Installaton on openwrt 19.07.10 (viva el dir320)**
 ```bash
 cd /tmp
-#you can put it to router via "upload package" without installation http://192.168.0.1/cgi-bin/luci/admin/system/opkg
+#you can put it to router via "upload package" without installation http://192.168.1.1/cgi-bin/luci/admin/system/opkg
 #mv upload.ipk tg-ws-proxy-mipsel-unknown-linux-musl.tar.gz
 wget https://github.com/yu-mor/tg-ws-proxy-rs/releases/latest/download/tg-ws-proxy-mipsel-unknown-linux-musl.tar.gz
 gunzip tg-ws-proxy-mipsel-unknown-linux-musl.tar.gz
